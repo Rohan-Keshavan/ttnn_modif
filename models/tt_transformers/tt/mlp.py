@@ -6,7 +6,7 @@ import torch
 
 import ttnn
 from models.common.lightweightmodule import LightweightModule
-from models.tt_transformers.tt.ccl import tt_all_reduce
+from models.tt_transformers.tt.ccl import tt_all_gather, tt_all_reduce
 from models.tt_transformers.tt.common import pad_to_size
 from models.tt_transformers.tt.model_config import OpGroup, TensorGroup
 
@@ -17,6 +17,7 @@ class MLP(LightweightModule):
     ):
         super().__init__()
 
+        self.layer_num = layer_num
         self.state_dict = state_dict
         self.mesh_device = mesh_device
         self.args = args
@@ -108,6 +109,7 @@ class MLP(LightweightModule):
         # In decode mode (seqlen <= 32) do DRAM sharded matmuls
         # These use HiFi2; this drops 1 bit of the activations but would be FLOP-bound on 12 cores with HiFi4
         memory_config = ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG if mode == "decode" else ttnn.DRAM_MEMORY_CONFIG
+
         w1_out = ttnn.linear(
             x,
             self.w1,
@@ -186,7 +188,8 @@ class MLP(LightweightModule):
         if mode == "decode" and not TG:
             # w2 may use a different core grid, this is a no-op if they already match
             w2_in = ttnn.to_memory_config(w2_in, self.model_config["SHARDED_MLP2_INPUT_MEMCFG"])
-
+            if self.layer_num == 0:
+                print("MLP w2_in memory config changed : ", w2_in.shape)
         ttnn.deallocate(w3_out)
         ttnn.deallocate(w1_out)
 
@@ -215,37 +218,76 @@ class MLP(LightweightModule):
             memory_config=memory_config,
             core_grid=None,  # FIXME: validate on TG ttnn.CoreGrid(y=8, x=8) if not pc_2 else None,
         )
+
+        if mode == "decode" and self.layer_num == 0:
+            print("MLP w2 out : ", w2_out.shape)
         ttnn.deallocate(w2_in)
         # if mode == "decode" and not TG:
         #     w2_out = ttnn.sharded_to_interleaved(w2_out, ttnn.DRAM_MEMORY_CONFIG)
-        w2_out_reduced = tt_all_reduce(
-            w2_out,
-            self.mesh_device,
-            cluster_axis=0,
-            dim=0 if (TG and self.dim < 8192) else 3,
-            num_reduce_scatter_links=self.args.num_reduce_scatter_links,
-            num_all_gather_links=self.args.num_all_gather_links,
-            sharded=(mode == "decode"),
-            memory_config=(
-                (self.model_config["FF2_OUT_REDUCE_SCATTER_MEMCFG"] if TG else w2_out.memory_config())
-                if mode == "decode"
-                else ttnn.DRAM_MEMORY_CONFIG
-            ),
-            dtype=self.args.ccl_dtype,
-            use_composite=True if self.dim == 8192 else False,
-            topology=self.args.ccl_topology(),
-        )
-
-        # Ensure dim 0 and 1 are 1
-        original_shape = w2_out_reduced.shape
-        w2_out_reduced = ttnn.reshape(
-            w2_out_reduced, (1, 1, original_shape[-4] * original_shape[-3] * original_shape[-2], original_shape[-1])
-        )
-        if mode == "decode":
-            w2_out_reduced = ttnn.to_memory_config(
-                w2_out_reduced,
-                self.model_config["SHARDED_ATTN_INPUT_MEMCFG"] if TG else self.model_config["DECODE_RESIDUAL_MEMCFG"],
+        if mode == "prefill":
+            w2_out_reduced = tt_all_reduce(
+                w2_out,
+                self.mesh_device,
+                cluster_axis=0,
+                dim=0 if (TG and self.dim < 8192) else 3,
+                num_reduce_scatter_links=self.args.num_reduce_scatter_links,
+                num_all_gather_links=self.args.num_all_gather_links,
+                sharded=(mode == "decode"),
+                memory_config=(
+                    (self.model_config["FF2_OUT_REDUCE_SCATTER_MEMCFG"] if TG else w2_out.memory_config())
+                    if mode == "decode"
+                    else ttnn.DRAM_MEMORY_CONFIG
+                ),
+                dtype=self.args.ccl_dtype,
+                use_composite=True if self.dim == 8192 else False,
+                topology=self.args.ccl_topology(),
             )
 
-        # ttnn.deallocate(w2_out)
-        return w2_out_reduced
+            # Ensure dim 0 and 1 are 1
+            original_shape = w2_out_reduced.shape
+            w2_out_reduced = ttnn.reshape(
+                w2_out_reduced, (1, 1, original_shape[-4] * original_shape[-3] * original_shape[-2], original_shape[-1])
+            )
+            w2_out.deallocate(True)
+            return w2_out_reduced
+
+        else:
+            w2_out_reduced = ttnn.reduce_scatter(
+                w2_out,
+                dim=3,
+                math_op=ttnn.ReduceType.Sum,
+                num_links=self.args.num_reduce_scatter_links,
+                topology=self.args.ccl_topology(),
+                memory_config=(
+                    self.model_config["FF2_OUT_REDUCE_SCATTER_MEMCFG"] if mode == "decode" else ttnn.DRAM_MEMORY_CONFIG
+                ),
+            )
+            if mode == "decode" and self.layer_num == 0:
+                print("w2 out post reduce_scatter : ", w2_out_reduced.shape)
+
+            w2_out_replicated = tt_all_gather(
+                w2_out_reduced,
+                mesh_device=self.mesh_device,
+                cluster_axis=None,
+                dim=3,
+                num_links=self.args.num_all_gather_links,
+                topology=self.args.ccl_topology(),
+                memory_config=ttnn.DRAM_MEMORY_CONFIG if mode == "prefill" else ttnn.L1_MEMORY_CONFIG,
+            )
+
+            if mode == "decode" and self.layer_num == 0:
+                print("w2 out post all gather : ", w2_out_replicated.shape)
+            w2_out_reduced.deallocate(True)
+
+            original_shape = w2_out_replicated.shape
+            w2_out_replicated = ttnn.reshape(
+                w2_out_replicated,
+                (1, 1, original_shape[-4] * original_shape[-3] * original_shape[-2], original_shape[-1]),
+            )
+            w2_out_replicated = ttnn.to_memory_config(
+                w2_out_replicated,
+                ttnn.L1_MEMORY_CONFIG,
+            )
+            if mode == "decode" and self.layer_num == 0:
+                print("mlp final : ", w2_out_replicated.shape)
+            return w2_out_replicated

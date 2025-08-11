@@ -33,6 +33,7 @@ def tt_all_reduce(
     # N300 and T3K: reduce_scatter
     if 1 in list(mesh_device.shape):
         if input_tensor.is_sharded() and not sharded:
+            print("Tensor is sharded. In common/ccl check")
             input_tensor_sharded = input_tensor
             input_tensor = ttnn.sharded_to_interleaved(input_tensor_sharded, ttnn.L1_MEMORY_CONFIG)
             input_tensor_sharded.deallocate(True)
@@ -59,6 +60,7 @@ def tt_all_reduce(
         input_tensor = ttnn.to_memory_config(input_tensor, ttnn.DRAM_MEMORY_CONFIG)
 
     if not use_composite:
+        print("Not using the composite.")
         gathered_tensor = ttnn.all_gather(
             input_tensor,
             dim,
@@ -81,6 +83,7 @@ def tt_all_reduce(
         )
         gathered_tensor.deallocate(True)
     else:
+        print("Tensor pre reduction : ", input_tensor.shape, input_tensor.layout)
         input_mem_cfg = input_tensor.memory_config()
         reduced_tensor = ttnn.reduce_scatter(
             input_tensor,
@@ -92,7 +95,7 @@ def tt_all_reduce(
             topology=topology,
             memory_config=ttnn.DRAM_MEMORY_CONFIG if not sharded else memory_config,
         )
-
+        print("Reduced tensor : ", reduced_tensor.shape, reduced_tensor.layout)
         reduced_tensor = ttnn.all_gather(
             reduced_tensor,
             dim,
@@ -102,7 +105,7 @@ def tt_all_reduce(
             topology=topology,
             memory_config=input_mem_cfg,
         )
-
+        print("Gathered tensor : ", reduced_tensor.shape, reduced_tensor.layout)
     # Reshape the reduced tensor to the original shape
     reduced_tensor = ttnn.reshape(reduced_tensor, original_shape)
 

@@ -85,11 +85,28 @@ class Transformer(LightweightModule):
                 add_unit_offset=self.args.rms_norm_add_unit_offset,
                 is_distributed=self.args.is_distributed_norm,
                 sharded_program_config=self.model_config["SHARDED_NORM_LM_HEAD_PRGM_CFG"],
+                # sharded_program_config=self.model_config["SHARDED_NORM_ATTN_PRGM_CFG"],
                 sharded_output_config=self.model_config["LM_HEAD_INPUT_MEMCFG"],
+                # sharded_output_config=self.model_config["SHARDED_ATTN_INPUT_MEMCFG"],
                 ccl_topology=self.args.ccl_topology(),
             ),
             args,
             args.is_galaxy,
+        )
+
+        self.norm_decode = RMSNorm(
+            device=mesh_device,
+            dim=args.dim,
+            eps=args.norm_eps,
+            state_dict=state_dict,
+            state_dict_prefix=args.get_state_dict_prefix("", None),
+            weight_cache_path=None if args.dummy_weights else weight_cache_path,
+            weight_dtype=ttnn.bfloat16,
+            weight_key="norm",
+            add_unit_offset=self.args.rms_norm_add_unit_offset,
+            is_distributed=False,
+            sharded_program_config=self.model_config["SHARDED_NORM_ATTN_PRGM_CFG"],
+            sharded_output_config=self.model_config["SHARDED_ATTN_INPUT_MEMCFG"],
         )
 
         self.lm_head = LMHead(
@@ -365,7 +382,8 @@ class Transformer(LightweightModule):
                 decoder_id=i, tensor=TensorGroup.ACTIVATION
             )
             if mode == "decode" and not self.args.is_galaxy:
-                x = ttnn.to_memory_config(x, self.model_config["DECODE_RESIDUAL_MEMCFG"], activation_dtype)
+                x = ttnn.to_memory_config(x, self.model_config["DECODE_RESIDUAL_REPLICATED_MEMCFG"], activation_dtype)
+                # x = ttnn.to_memory_config(x, self.model_config["DECODE_RESIDUAL_MEMCFG"], activation_dtype)
             elif activation_dtype is not None and x.dtype != activation_dtype:
                 x = ttnn.typecast(x, activation_dtype)
 
@@ -389,12 +407,19 @@ class Transformer(LightweightModule):
             x = ttnn.slice(x, (0, 0, get_last_token, 0), (1, 1, get_last_token + 32, x.shape[-1]))
 
         # Output norm
-        x = self.norm(x, mode=mode)
+        if mode == "prefill":
+            x = self.norm(x, mode=mode)
+        else:
+            print("In model class. Input to output norm : ", x.shape)
+            x = self.norm_decode(x, mode=mode, in_sharded=True, out_sharded=True)
+            print("In model class. Output of output norm: ", x.shape)
+            x = ttnn.to_memory_config(x, self.model_config["LM_HEAD_INPUT_MEMCFG"])
 
         if mode == "prefill" and self.model_config["LM_HEAD_INPUT_MEMCFG"].is_sharded():
             x = ttnn.interleaved_to_sharded(x, self.model_config["LM_HEAD_INPUT_MEMCFG"])
 
         x = self.lm_head(x)
+        print("In model class. LM head output : ", x.shape)
 
         if mode == "prefill":
             x = ttnn.to_layout(x, layout=ttnn.ROW_MAJOR_LAYOUT)

@@ -681,6 +681,20 @@ class ModelArgs:
                 )
             )
 
+            # Residual memory config for replicated residuals
+            residual_grid_replicated = self.dram_shard_core_grid_for_k(self.dim)
+            self.model_config["DECODE_RESIDUAL_REPLICATED_MEMCFG"] = (
+                ttnn.L1_MEMORY_CONFIG
+                if self.is_galaxy
+                else ttnn.create_sharded_memory_config(
+                    (self.tile_padded_batch_rows, self.dim // residual_grid.num_cores),
+                    residual_grid,
+                    ttnn.ShardStrategy.WIDTH,
+                    ttnn.ShardOrientation.ROW_MAJOR,
+                    use_height_and_width_as_shard_shape=True,
+                )
+            )
+
             # Chunk values based on what works best empirically
             self.model_config["SDPA_PROGCFG"] = lambda seqlen: ttnn.SDPAProgramConfig(
                 compute_with_storage_grid_size=(8, 8),
@@ -1909,6 +1923,7 @@ class ModelArgs:
         Args:
             grid (ttnn.CoreGrid): Grid specification for the norm operation
         """
+        # compute_grid = ttnn.CoreGrid(x=4, y=8)
         block_w = self.dim // grid.num_cores // self.tile_size
         # Find largest value <= 4 that evenly divides block_w
         subblock_w = 4
@@ -1916,6 +1931,7 @@ class ModelArgs:
             if block_w % subblock_w == 0:
                 break
             subblock_w -= 1
+        # print('Subblock returned and in grid : ' , subblock_w, grid)
         return ttnn.LayerNormShardedMultiCoreProgramConfig(
             compute_with_storage_grid_size=[grid.x, grid.y],
             subblock_w=subblock_w,

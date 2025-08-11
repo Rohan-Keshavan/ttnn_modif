@@ -68,9 +68,12 @@ class DistributedNorm(LightweightModule):
 
         input_mem_cfg = self.norm.sharded_output_config if mode == "decode" else ttnn.DRAM_MEMORY_CONFIG
 
+        # if mode == "decode":
+        # print('tt/distributed_norm : In ',x.shape, x.layout)
         # Distributed norm already performs a gather
         if self.args.is_multichip and not self.args.is_distributed_norm(mode):
             x = ttnn.all_gather(x, dim=3, num_links=1, topology=self.args.ccl_topology(), memory_config=input_mem_cfg)
+            # print('ttnn_all_gather out :    ', x.shape, x.layout)
         else:
             x = ttnn.to_memory_config(x, input_mem_cfg)
 
@@ -79,5 +82,6 @@ class DistributedNorm(LightweightModule):
         # Distributed norm requires a gather
         if self.args.is_distributed_norm(mode):
             x = ttnn.all_gather(x, dim=3, num_links=1, topology=self.args.ccl_topology())
-
+        # if mode == "decode":
+        # print('tt/distributed_norm : Out : ', x.shape, x.layout)
         return x

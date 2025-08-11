@@ -184,9 +184,9 @@ def prepare_generator_args(
             "models/tt_transformers/demo/sample_prompts/input_data_questions_prefill_128.json",  # input_prompts
             True,  # instruct mode
             1,  # repeat_batches
-            1024,  # max_seq_len
+            4096,  # max_seq_len
             1,  # batch_size
-            200,  # max_generated_tokens
+            1024,  # max_generated_tokens
             True,  # paged_attention
             {"page_block_size": 32, "page_max_num_blocks_per_dp": 1024},  # page_params
             {"temperature": 0, "top_p": 0.08},  # sampling_params (argmax)
@@ -200,7 +200,7 @@ def prepare_generator_args(
             1,  # repeat_batches
             1024,  # max_seq_len
             32,  # batch_size
-            200,  # max_generated_tokens
+            256,  # max_generated_tokens
             True,  # paged_attention
             {"page_block_size": 32, "page_max_num_blocks_per_dp": 1024},  # page_params
             {"temperature": 0, "top_p": 0.08},  # sampling_params (argmax)
@@ -510,7 +510,7 @@ def test_demo_text(
 
     num_devices = mesh_device.get_num_devices() if isinstance(mesh_device, ttnn.MeshDevice) else 1
     global_batch_size = batch_size * data_parallel  # input batch_size is interpreted as size per DP group
-
+    print("Num devices , global_batch_size , mesh_device", num_devices, global_batch_size, mesh_device)
     # uneven split of devices per DP group not supported
     if data_parallel > num_devices or num_devices % data_parallel != 0:
         pytest.skip(f"Invalid number of DP groups: {data_parallel}, for {num_devices} devices")
@@ -557,7 +557,8 @@ def test_demo_text(
     # If batch_size=1, the same prompt is repeated for each batch
     repeat_batch_prompts = []
     for i in range(repeat_batches):
-        repeat_batch_prompts.append([input_prompts[(j + i) % len(input_prompts)] for j in range(len(input_prompts))])
+        # repeat_batch_prompts.append([input_prompts[(j + i) % len(input_prompts)] for j in range(len(input_prompts))])
+        repeat_batch_prompts.append([input_prompts[(j + i) % len(input_prompts)] for j in range(1)])
 
     model_args, model, page_table, tt_kv_cache, tokenizer = prepare_generator_args(
         num_devices=num_devices,
