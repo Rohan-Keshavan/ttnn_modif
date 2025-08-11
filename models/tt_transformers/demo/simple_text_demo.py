@@ -180,6 +180,20 @@ def prepare_generator_args(
 @pytest.mark.parametrize(
     "input_prompts, instruct, repeat_batches, max_seq_len, batch_size, max_generated_tokens, paged_attention, page_params, sampling_params, stop_at_eos, ci_only, data_parallel",
     [
+        (  # MMLU Pro, batch 1
+            "models/tt_transformers/demo/sample_prompts/mmlu_pro/tt_inputs_history.json",  # mmlu-pro model data
+            True,  # instruct mode
+            1,  # n repeat batches
+            8192,  # Max seq len
+            1,  # batch_size
+            4096,  # max_generated_tokens
+            True,  # paged_attention
+            {"page_block_size": 32, "page_max_num_blocks_per_dp": 1024},  # page_params
+            {"temperature": 0, "top_p": 0.08},  # sampling_params (Argmax)
+            True,  # stop_at_eos
+            False,  # ci_only
+            1,
+        ),
         (  # Batch-1 run (Latency) - single user, small prompt
             "models/tt_transformers/demo/sample_prompts/input_data_questions_prefill_128.json",  # input_prompts
             True,  # instruct mode
@@ -409,6 +423,7 @@ def prepare_generator_args(
         ),
     ],
     ids=[
+        "mmlu-pro"  # mmlu-pro
         "batch-1",  # latency
         "batch-32",  # throughput
         "long-context-64k",  # 64k context, max_seq_len=128k
