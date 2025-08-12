@@ -125,8 +125,7 @@ class RMSNorm(LightweightModule):
             assert not distributed, "Distributed RMSNorm does not support sharded inputs"
         else:
             assert not out_sharded, "Non-sharded version of RMSNorm cannot output a sharded tensor"
-        # print('In RMS norm, selected norm : ' , norm)
-        # print('Memory and program configs : ' , memory_config, program_config)
+
         """
         if mode == "decode":
             if self.layer_num == 0:
@@ -154,14 +153,10 @@ class RMSNorm(LightweightModule):
     ):
         assert program_config is None, "Distributed RMSNorm does not support sharded inputs"
         assert memory_config is None, "Distributed RMSNorm does not support sharded outputs"
-        # print(' **************** In Distributed RMS Norm Implementation *****************')
-        # if self.layer_num == 26:
-        #    print('')
-        #    print('Distributed RMS norm , in : ' , inp.shape, inp.layout)
+
         # Run distributed rmsnorm part 1
         tt_stats = ttnn.rms_norm_pre_all_gather(inp, compute_kernel_config=compute_kernel_config, dtype=ttnn.bfloat16)
-        # if self.layer_num == 26:
-        #    print('Distributed norm part 1 (pre_all_gather) op : ' , tt_stats.shape, tt_stats.layout)
+
         # AllGather stats
         tt_stats = ttnn.all_gather(
             tt_stats,
@@ -170,8 +165,6 @@ class RMSNorm(LightweightModule):
             topology=self.ccl_topology,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
-        # if self.layer_num == 26:
-        #    print('Distributed norm part 2 (all_gather) op : ' ,  tt_stats.shape, tt_stats.layout)
 
         # Run distributed rmsnorm part 2
         tt_out = ttnn.rms_norm_post_all_gather(
@@ -181,8 +174,7 @@ class RMSNorm(LightweightModule):
             weight=weight,
             compute_kernel_config=compute_kernel_config,
         )
-        # if self.layer_num == 26:
-        #    print('Distributed norm part 3 (post all gather) op : ' , tt_out.shape, tt_out.layout)
+
         tt_stats.deallocate(True)
 
         return tt_out

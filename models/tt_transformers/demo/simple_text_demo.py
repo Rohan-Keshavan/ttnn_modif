@@ -93,6 +93,22 @@ def load_inputs(user_input, batch, instruct):
     return in_prompt
 
 
+# load mmlu-pro inputs ('tt prepared' , category wise)
+def load_prepared_inputs_mmlu_pro(user_input, batch_size):
+    with open(user_input, "r") as f:
+        user_input = json.load(f)
+    if len(user_input) < batch_size:
+        logger.warning(f"n_users < batch_size. Repeating prompts to match batch_size")
+        user_input = user_input * batch_size
+    in_prompt = []
+    n_prompts = int(len(user_input))
+    for i in range(n_prompts):  # Keep this. Might need to add context content later on
+        prompt = user_input[i]
+        in_prompt.append(prompt)
+    print("n_prompts : ", n_prompts)
+    return in_prompt, n_prompts
+
+
 def create_tt_page_table(global_batch_size, data_parallel, paged_attention_config: PagedAttentionConfig):
     page_table = None
 
@@ -181,18 +197,18 @@ def prepare_generator_args(
     "input_prompts, instruct, repeat_batches, max_seq_len, batch_size, max_generated_tokens, paged_attention, page_params, sampling_params, stop_at_eos, ci_only, data_parallel",
     [
         (  # MMLU Pro, batch 1
-            "models/tt_transformers/demo/sample_prompts/mmlu_pro/tt_inputs_history.json",  # mmlu-pro model data
+            "models/tt_transformers/demo/sample_prompts/mmlu-pro/model_inputs/model_inputs_computer_science.json",  # mmlu-pro model data
             True,  # instruct mode
             1,  # n repeat batches
-            8192,  # Max seq len
+            8 * 1024,  # Max seq len
             1,  # batch_size
-            4096,  # max_generated_tokens
+            4 * 1024,  # max_generated_tokens
             True,  # paged_attention
-            {"page_block_size": 32, "page_max_num_blocks_per_dp": 1024},  # page_params
+            {"page_block_size": 2 * 32, "page_max_num_blocks_per_dp": 2 * 1024},  # page_params
             {"temperature": 0, "top_p": 0.08},  # sampling_params (Argmax)
             True,  # stop_at_eos
             False,  # ci_only
-            1,
+            1,  # data_parallel
         ),
         (  # Batch-1 run (Latency) - single user, small prompt
             "models/tt_transformers/demo/sample_prompts/input_data_questions_prefill_128.json",  # input_prompts
@@ -423,7 +439,7 @@ def prepare_generator_args(
         ),
     ],
     ids=[
-        "mmlu-pro"  # mmlu-pro
+        "mmlu-pro",  # mmlu-pro
         "batch-1",  # latency
         "batch-32",  # throughput
         "long-context-64k",  # 64k context, max_seq_len=128k
@@ -491,7 +507,7 @@ def test_demo_text(
         pytest.skip("TG only supports batch 1 and 32")
 
     enable_trace = True  # Use tracing for better perf
-    print_to_file = False  # Enable this flag to print the output of all users to a file
+    print_to_file = True  # Enable this flag to print the output of all users to a file
 
     # Override parameters from command line if they are provided
     input_prompts = request.config.getoption("--input_prompts") or input_prompts
@@ -525,8 +541,10 @@ def test_demo_text(
 
     num_devices = mesh_device.get_num_devices() if isinstance(mesh_device, ttnn.MeshDevice) else 1
     global_batch_size = batch_size * data_parallel  # input batch_size is interpreted as size per DP group
-    print("Num devices , global_batch_size , mesh_device", num_devices, global_batch_size, mesh_device)
+
+    # print("Num devices , global_batch_size , mesh_device", num_devices, global_batch_size, mesh_device)
     # uneven split of devices per DP group not supported
+
     if data_parallel > num_devices or num_devices % data_parallel != 0:
         pytest.skip(f"Invalid number of DP groups: {data_parallel}, for {num_devices} devices")
 
@@ -547,12 +565,21 @@ def test_demo_text(
         logger.info(f"The decode generation will only stop at the max_generated_tokens limit == {max_generated_tokens}")
 
     if print_to_file:
-        # Creat batch output file
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        output_directory = "models/tt_transformers/demo/output"
-        os.makedirs(output_directory, exist_ok=True)
-        os.chmod(output_directory, 0o755)
-        output_filename = f"{output_directory}/llama_text_demo_output_{timestamp}.txt"
+        if "mmlu-pro" in str(input_prompts):
+            mmlu_pro_category = (str(input_prompts)).split("/")[-1].split("_")[-1].split(".json")[0]
+            output_directory = "models/tt_transformers/demo/outputs/mmlu-pro"
+            model_name_local = (os.getenv("HF_MODEL")).split("/")[-2]
+            generation_temperature = int(100 * sampling_params["temperature"])
+            run_mode = "perf"  # Acc runs, post demo
+            run_batch_size = batch_size
+            output_filename = f"{output_directory}/{model_name_local}_output_mmlu-pro-{mmlu_pro_category}_T-{generation_temperature}_M-{run_mode}_BS-{run_batch_size}.txt"
+        else:
+            # Creat batch output file
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            output_directory = "models/tt_transformers/demo/output"
+            os.makedirs(output_directory, exist_ok=True)
+            os.chmod(output_directory, 0o755)
+            output_filename = f"{output_directory}/llama_text_demo_output_{timestamp}.txt"
 
     # Start profiler
     logger.info(f"Start profiler")
@@ -564,9 +591,23 @@ def test_demo_text(
     if len(input_prompts) == 1:  # Manual input
         input_prompts = input_prompts * global_batch_size
     else:  # Inputs from file
-        input_prompts = load_inputs(input_prompts, global_batch_size, input_prompts)
+        if "mmlu-pro" in str(input_prompts):
+            input_prompts, n_prompts = load_prepared_inputs_mmlu_pro(input_prompts, batch_size=1)
+            repeat_batch_prompts = []
+            for i in range(n_prompts):
+                repeat_batch_prompts.append([input_prompts[i]])
+        else:
+            input_prompts = load_inputs(input_prompts, global_batch_size, input_prompts)
+            # To simulate a deployment environment, the demo supports repeating batched prompts.
+            # This loop will rotate the prompts between the users for each batch, to simulate users sending different requests
+            # If batch_size=1, the same prompt is repeated for each batch
+            repeat_batch_prompts = []
+            for i in range(repeat_batches):
+                # repeat_batch_prompts.append([input_prompts[(j + i) % len(input_prompts)] for j in range(len(input_prompts))])
+                repeat_batch_prompts.append([input_prompts[(j + i) % len(input_prompts)] for j in range(1)])
     profiler.end("loading_inputs")
 
+    """
     # To simulate a deployment environment, the demo supports repeating batched prompts.
     # This loop will rotate the prompts between the users for each batch, to simulate users sending different requests
     # If batch_size=1, the same prompt is repeated for each batch
@@ -574,6 +615,7 @@ def test_demo_text(
     for i in range(repeat_batches):
         # repeat_batch_prompts.append([input_prompts[(j + i) % len(input_prompts)] for j in range(len(input_prompts))])
         repeat_batch_prompts.append([input_prompts[(j + i) % len(input_prompts)] for j in range(1)])
+    """
 
     model_args, model, page_table, tt_kv_cache, tokenizer = prepare_generator_args(
         num_devices=num_devices,

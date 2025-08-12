@@ -404,10 +404,13 @@ class Attention(LightweightModule):
         # QKV matmuls
         # Use HiFi2 for DRAM-sharded matmuls as they are otherwise flop-bound. Loses 1 bit of activation precision.
         ###
+        """
         if self.layer_num == 0:
             print("")
             print("Attn class")
             print("In shape : ", x.shape)
+        """
+
         xqkv_fused_sharded = ttnn.linear(
             x,
             self.wqkv,
@@ -417,8 +420,10 @@ class Attention(LightweightModule):
             compute_kernel_config=self.li_qkv_decode_compute_kernel_cfg,
             dtype=self.ccl_dtype if self.TG else self.activation_dtype or ttnn.bfloat16,
         )
-        if self.layer_num == 0:
-            print("xqkv_fused_sharded : ", xqkv_fused_sharded.shape)
+
+        # if self.layer_num == 0:
+        #    print("xqkv_fused_sharded : ", xqkv_fused_sharded.shape)
+
         # FIXME: File bug against dram-sharded matmuls with bias
         if self.wqkv_bias_decode:
             # select the bias tensor based on the number of tiles in the rows
@@ -438,9 +443,10 @@ class Attention(LightweightModule):
             dtype=self.ccl_dtype,
             topology=self.ccl_topology,
         )
-        if self.layer_num == 0:
-            print("xqkv_fused : ", xqkv_fused.shape)
-            # print('Difference : ' , ttnn.sum(xqkv_fused - xqkv_fused_sharded))
+
+        # if self.layer_num == 0:
+        #    print("xqkv_fused : ", xqkv_fused.shape)
+        #    # print('Difference : ' , ttnn.sum(xqkv_fused - xqkv_fused_sharded))
 
         if self.TG:
             # TODO: Slice the fused_query_key_value tensor get batch=8
@@ -453,8 +459,8 @@ class Attention(LightweightModule):
         else:
             # bfloat16 is required by nlp_create_qkv_heads_decode
             xqkv_fused = ttnn.sharded_to_interleaved(xqkv_fused_sharded, ttnn.L1_MEMORY_CONFIG, ttnn.bfloat16)
-            if self.layer_num == 0:
-                print("xqkv_fused : ", xqkv_fused.shape)
+            # if self.layer_num == 0:
+            #    print("xqkv_fused : ", xqkv_fused.shape)
         ttnn.deallocate(xqkv_fused_sharded)
 
         # Reshape such that true unpadded batch is tracked in shape
@@ -462,8 +468,10 @@ class Attention(LightweightModule):
         xqkv_fused = ttnn.reshape(
             xqkv_fused, (1, 1, self.batch_size_per_device_group, fqkv_shape[3]), (1, 1, 32, fqkv_shape[3])
         )
-        if self.layer_num == 0:
-            print("xqkv_fused reshaped : ", xqkv_fused.shape)
+
+        # if self.layer_num == 0:
+        #    print("xqkv_fused reshaped : ", xqkv_fused.shape)
+
         ###
         # Reshape and rotary embeddings
         ###
@@ -477,8 +485,10 @@ class Attention(LightweightModule):
             num_kv_heads=self.n_local_kv_heads,
             memory_config=self.model_config["CREATE_QKV_DECODE_SHARD"],
         )
-        if self.layer_num == 0:
-            print("q , k ,v pre rot : ", q_heads_pre_rot_1BQD.shape, k_heads_pre_rot_1BKD.shape, v_heads_1BKD.shape)
+
+        # if self.layer_num == 0:
+        #    print("q , k ,v pre rot : ", q_heads_pre_rot_1BQD.shape, k_heads_pre_rot_1BKD.shape, v_heads_1BKD.shape)
+
         q_heads_pre_rot_1BQD = self.q_norm(q_heads_pre_rot_1BQD, mode="decode")
         k_heads_pre_rot_1BKD = self.k_norm(k_heads_pre_rot_1BKD, mode="decode")
 
@@ -546,22 +556,26 @@ class Attention(LightweightModule):
                 compute_kernel_config=self.sdpa_decode_compute_kernel_cfg,
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,  # FIXME: why not L1 height sharded e.g. SCORES_BATCHED_MM_OUTPUT_MEMCFG?
             )
-        if self.layer_num == 0:
-            print("attn_output_1G4D : ", attn_output_1G4D.shape)
+
+        # if self.layer_num == 0:
+        #    print("attn_output_1G4D : ", attn_output_1G4D.shape)
         ttnn.deallocate(q_heads_1BQD)
 
         attn_output_11BH = ttnn.to_memory_config(
             attn_output_1G4D,
             memory_config=self.model_config["SCORES_BATCHED_MM_OUTPUT_MEMCFG"](self.batch_size_per_device_group),
         )
-        if self.layer_num == 0:
-            print("attn_output_l1BH : ", attn_output_11BH.shape)
+
+        # if self.layer_num == 0:
+        #    print("attn_output_l1BH : ", attn_output_11BH.shape)
+
         attn_output_cat = ttnn.experimental.nlp_concat_heads_decode(
             attn_output_11BH,
             num_heads=self.n_local_heads,
         )
-        if self.layer_num == 0:
-            print("attn_output_cat : ", attn_output_cat.shape)
+
+        # if self.layer_num == 0:
+        #    print("attn_output_cat : ", attn_output_cat.shape)
         ttnn.deallocate(attn_output_11BH)
         ttnn.deallocate(attn_output_1G4D)
 
@@ -582,8 +596,8 @@ class Attention(LightweightModule):
             )
             ttnn.deallocate(attn_output_cat)
             dense_out_sharded = ttnn.to_memory_config(dense_out_sharded, self.model_config["DECODE_RESIDUAL_MEMCFG"])
-            if self.layer_num == 0:
-                print("dense_out_sharded (tt_all_gather_matmul) : ", dense_out_sharded.shape)
+            # if self.layer_num == 0:
+            #    print("dense_out_sharded (tt_all_gather_matmul) : ", dense_out_sharded.shape)
             return dense_out_sharded
 
         else:
@@ -596,11 +610,14 @@ class Attention(LightweightModule):
                 memory_config=self.model_config["GATHER_USERS_MEMCFG"](list(self.mesh_device.shape)[1]),
                 sharded=True,
                 # dtype=self.ccl_dtype,  # Running bf16 until we have SDPA output bfp8 df; otherwise we have two sharded to interleaved/interleaved to sharded conversions
-            )
+            )  # This is a pass op for T3K
+
+            """
             if self.layer_num == 0:
                 print("attn_output : post all gather (not tt_all_gather_matmul) : ", attn_output.shape)
                 print("wo shape    : ", self.wo.shape)
                 print("wo unfuse   : ", self.wo_unfuse.shape)
+            """
             if self.TG:
                 attn_output = ttnn.to_memory_config(attn_output, ttnn.L1_MEMORY_CONFIG)
                 # user_selection_matrix = [1, 1, 32, 128]
@@ -623,8 +640,8 @@ class Attention(LightweightModule):
                 dtype=ttnn.bfloat8_b if self.TG else None,
                 compute_kernel_config=self.li_o_decode_compute_kernel_cfg,
             )
-            if self.layer_num == 0:
-                print("dense out sharded post unfuse matmul (not_all_gather_matmul) : ", dense_out_sharded.shape)
+            # if self.layer_num == 0:
+            #    print("dense out sharded post unfuse matmul (not_all_gather_matmul) : ", dense_out_sharded.shape)
             ttnn.deallocate(attn_output_cat)
 
             # All reduce
@@ -648,10 +665,13 @@ class Attention(LightweightModule):
                 sharded=True,
                 dtype=self.ccl_dtype,
                 use_composite=True if self.hidden_size == 8192 else False,
-            )  # This is just a reduce scatter. Need to all-gather manually.
+            )  # This is a reduce scatter. Need to all-gather manually.
+
+            """
             if self.layer_num == 0:
                 print("dense_out_reduced_final (reduce-scatter through tt_all_reduce): ", dense_out_reduced.shape)
                 print("Output is sharded : ", dense_out_reduced.is_sharded())
+            """
 
             # All gather
             dense_out_reduced_replicated = tt_all_gather(
@@ -664,8 +684,9 @@ class Attention(LightweightModule):
                 memory_config=ttnn.L1_MEMORY_CONFIG,
             )
             dense_out_reduced.deallocate(True)
-            if self.layer_num == 0:
-                print("Dense out reduced - replicated : ", dense_out_reduced_replicated.shape)
+
+            # if self.layer_num == 0:
+            #    print("Dense out reduced - replicated : ", dense_out_reduced_replicated.shape)
 
             if not self.TG:
                 dense_out_reduced_replicated = ttnn.to_memory_config(

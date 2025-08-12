@@ -124,6 +124,7 @@ class TransformerBlock(LightweightModule):
             sharded_program_config=self.model_config["SHARDED_NORM_ATTN_PRGM_CFG"],
             sharded_output_config=self.model_config["SHARDED_ATTN_INPUT_MEMCFG"],
         )
+
         self.attention_norm_decode = RMSNorm(
             device=mesh_device,
             dim=args.dim,
@@ -153,6 +154,8 @@ class TransformerBlock(LightweightModule):
         kv_cache=None,
     ) -> ttnn.Tensor:
         TG = self.args.is_galaxy
+
+        # Have a prefill and decode block
 
         # x is fractured across devices and interleaved in DRAM (for prefill) and sharded in L1 (for decode)
         if mode == "prefill":
@@ -185,11 +188,8 @@ class TransformerBlock(LightweightModule):
         if mode == "prefill":
             attn_in = self.attention_norm_prefill(x, mode)
         else:
-            # print('Performing attn norm decode..')
-            # print('Sharding the input tensor..')
             x = ttnn.to_memory_config(x, self.model_config["DECODE_RESIDUAL_REPLICATED_MEMCFG"])
             attn_in = self.attention_norm_decode(x, mode, in_sharded=True, out_sharded=True)
-            print("Attn norm done. Shape : ", attn_in.shape)
 
         # Attention takes replicated inputs and produces fractured  outputs : In prefill
         # Attention takes replicated inputs and produces replicated outputs : In decode
@@ -251,6 +251,7 @@ class TransformerBlock(LightweightModule):
             else:
                 if mode == "decode":
                     ff_in = ttnn.to_memory_config(ff_in, self.model_config["SHARDED_MLP_INPUT_MEMCFG"])
+
         # MLP takes replicated inputs and produces fractured  outputs in prefill
         # MLP takes replicated inputs and produces replicated outputs in decode
         ff_out = self.feed_forward.forward(ff_in, mode)
@@ -272,17 +273,6 @@ class TransformerBlock(LightweightModule):
                 else activation_dtype or ttnn.bfloat16,
             )
         else:
-            """
-            h_replicated = tt_all_gather(
-                    h,
-                    dim=3,
-                    num_links=self.args.num_all_gather_links,
-                    cluster_axis=None,
-                    mesh_device=self.mesh_device,
-                    topology=self.args.ccl_topology(),
-                    memory_config=ttnn.DRAM_MEMORY_CONFIG if mode=="prefill" else ttnn.L1_MEMORY_CONFIG,
-                    )
-            """
             out = ttnn.add(
                 h,
                 ff_out,
@@ -291,7 +281,6 @@ class TransformerBlock(LightweightModule):
                 else self.model_config["DECODE_RESIDUAL_REPLICATED_MEMCFG"],
                 dtype=activation_dtype or ttnn.bfloat16,
             )
-            # h_replicated.deallocate(True)
 
         h.deallocate(True)
         return out  # fractured across devices

@@ -1244,7 +1244,9 @@ class ModelArgs:
 
             self.VISION_MAX_MM_SEQ = nearest_32(self.vision_chunk_ntok)
 
-            # RMS NORM
+            # RMS NORM : Why does only this sat kernel constraints ?
+            self.model_config["SHARDED_NORM_PRGM_CFG"] = self.create_sharded_norm_config(attn_input_grid)
+
             self.model_config["SHARDED_NORM_ATTN_PRGM_CFG"] = self.create_sharded_norm_config(attn_input_grid)
             self.model_config["SHARDED_NORM_MLP_PRGM_CFG"] = self.create_sharded_norm_config(mlp_core_grid)
             self.model_config["SHARDED_NORM_LM_HEAD_PRGM_CFG"] = self.create_sharded_norm_config(self.lm_head_core_grid)
