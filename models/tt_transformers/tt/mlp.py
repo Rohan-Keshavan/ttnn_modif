@@ -52,6 +52,13 @@ class MLP(LightweightModule):
             cache_file_name=cache_name(name),
         )
 
+        self.compute_kernel_config_hifi2_fp32 = ttnn.WormholeComputeKernelConfig(
+            math_fidelity=ttnn.MathFidelity.HiFi2,
+            math_approx_mode=True,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=True,
+        )
+
         # Sharded weights
         w1_dims = (-1, -2) if args.is_galaxy else (-2, -1)
         w2_dims = (-2, -1) if args.is_galaxy else (-1, -2)
@@ -113,7 +120,9 @@ class MLP(LightweightModule):
             self.w1,
             dtype=ttnn.bfloat8_b if TG else activation_dtype or ttnn.bfloat16,
             core_grid=None,  # FIXME: validate on TG ttnn.CoreGrid(y=8, x=8) if not pc_1 else None,
-            compute_kernel_config=li_ff1_3_compute_kernel_cfg,
+            compute_kernel_config=li_ff1_3_compute_kernel_cfg
+            if mode == "prefill"
+            else self.compute_kernel_config_hifi2_fp32,
             program_config=pc_1,
             memory_config=memory_config,
         )
@@ -123,7 +132,9 @@ class MLP(LightweightModule):
             self.w3,
             dtype=ttnn.bfloat8_b if TG else activation_dtype or ttnn.bfloat16,
             core_grid=None,  # FIXME: validate on TG ttnn.CoreGrid(y=8, x=8) if not pc_3 else None,
-            compute_kernel_config=li_ff1_3_compute_kernel_cfg,
+            compute_kernel_config=li_ff1_3_compute_kernel_cfg
+            if mode == "prefill"
+            else self.compute_kernel_config_hifi2_fp32,
             program_config=pc_3,
             memory_config=memory_config,
         )
@@ -209,7 +220,9 @@ class MLP(LightweightModule):
         w2_out = ttnn.linear(
             w2_in,
             self.w2,
-            compute_kernel_config=li_ff2_compute_kernel_cfg,
+            compute_kernel_config=li_ff2_compute_kernel_cfg
+            if mode == "prefill"
+            else self.compute_kernel_config_hifi2_fp32,
             dtype=self.args.ccl_dtype if TG else activation_dtype or ttnn.bfloat16,
             program_config=pc_2,
             memory_config=memory_config,

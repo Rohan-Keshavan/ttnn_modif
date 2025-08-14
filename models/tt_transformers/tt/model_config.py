@@ -630,7 +630,7 @@ class ModelArgs:
             self.compute_kernel_config_lofi = ttnn.WormholeComputeKernelConfig(
                 math_fidelity=ttnn.MathFidelity.LoFi,
                 math_approx_mode=False,
-                fp32_dest_acc_en=False,
+                fp32_dest_acc_en=False,  # False
                 packer_l1_acc=True,
             )
             self.compute_kernel_config_hifi2 = ttnn.WormholeComputeKernelConfig(
@@ -642,7 +642,7 @@ class ModelArgs:
             self.compute_kernel_config_hifi2_fp16 = ttnn.WormholeComputeKernelConfig(
                 math_fidelity=ttnn.MathFidelity.HiFi2,
                 math_approx_mode=False,
-                fp32_dest_acc_en=False,
+                fp32_dest_acc_en=False,  # False
                 packer_l1_acc=True,
             )
             self.compute_kernel_config_hifi4 = ttnn.WormholeComputeKernelConfig(
@@ -654,7 +654,7 @@ class ModelArgs:
             self.compute_kernel_config_hifi2_na = ttnn.WormholeComputeKernelConfig(
                 math_fidelity=ttnn.MathFidelity.HiFi2,
                 math_approx_mode=False,
-                fp32_dest_acc_en=False,
+                fp32_dest_acc_en=False,  # False
                 packer_l1_acc=False,
             )
             self.compute_kernel_config_sdpa = ttnn.WormholeComputeKernelConfig(
@@ -886,7 +886,7 @@ class ModelArgs:
             self.model_config["SDPA_DECODE_COMPUTE_PROGCFG"] = ttnn.WormholeComputeKernelConfig(
                 math_fidelity=ttnn.MathFidelity.HiFi2,
                 math_approx_mode=False,
-                fp32_dest_acc_en=False,
+                fp32_dest_acc_en=True,  # Was False
                 packer_l1_acc=False,
             )
 
