@@ -58,17 +58,20 @@ class RMSNorm(LightweightModule):
         self.ccl_topology = ccl_topology
 
         self.layer_num = layer_num
-        if state_dict_prefix:
-            weight_name = f"{state_dict_prefix}{weight_key}.weight"
-        else:
-            if layer_num is None:
-                weight_name = f"{weight_key}.weight"
-            else:
-                weight_name = f"layers.{layer_num}.{weight_key}.weight"
 
-        torch_weight = (
-            state_dict[weight_name].unsqueeze(0).view(1, 1, dim).reshape([1, 1, dim // SHARD_HEIGHT, SHARD_HEIGHT])
-        )
+        if weight_key == "pick_from_state_dict":
+            torch_weight = state_dict
+        else:
+            if state_dict_prefix:
+                weight_name = f"{state_dict_prefix}{weight_key}.weight"
+            else:
+                if layer_num is None:
+                    weight_name = f"{weight_key}.weight"
+                else:
+                    weight_name = f"layers.{layer_num}.{weight_key}.weight"
+            torch_weight = (
+                state_dict[weight_name].unsqueeze(0).view(1, 1, dim).reshape([1, 1, dim // SHARD_HEIGHT, SHARD_HEIGHT])
+            )
 
         # Add offset before caching
         if add_unit_offset:
