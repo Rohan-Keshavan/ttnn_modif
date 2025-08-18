@@ -12,6 +12,7 @@ import pytest
 import requests
 import torch
 from loguru import logger
+from tracy import Profiler
 
 import ttnn
 from models.demos.utils.llm_demo_utils import create_benchmark_data, verify_perf
@@ -24,6 +25,8 @@ from models.tt_transformers.tt.common import (
 )
 from models.tt_transformers.tt.generator import Generator, SamplingParams, create_submeshes
 from models.tt_transformers.tt.model_config import DecodersPrecision, determine_device_name, parse_decoder_json
+
+tracy_profiler = Profiler()
 
 
 def load_and_cache_context(context_url, cache_dir, max_length=None):
@@ -649,6 +652,7 @@ def test_demo_text(
     for batch_idx, input_prompts in enumerate(repeat_batch_prompts):
         logger.info(f"Processing batch {batch_idx}")
         profiler.start(f"preprocess_prefill_inputs", iteration=batch_idx)
+
         # Preprocess initial prompt inputs
         (
             input_tokens_prefill_pt,
@@ -685,12 +689,15 @@ def test_demo_text(
 
         logger.info("Starting prefill warmup...")
         profiler.start(f"compile_prefill", iteration=batch_idx)
+
+        tracy_profiler.enable()
         logits = generator.prefill_forward_text(
             input_tokens_prefill_pt,  # Prefill warmup for all users, in case some users have different seqlens than others
             page_table=page_table,
             kv_cache=tt_kv_cache,
             prompt_lens=decoding_pos,
         )
+        tracy_profiler.disable()
         profiler.end(f"compile_prefill", iteration=batch_idx)
         logger.info("Finished prefill warmup")
 

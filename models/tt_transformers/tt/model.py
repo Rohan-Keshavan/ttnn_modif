@@ -70,7 +70,8 @@ class Transformer(LightweightModule):
                 paged_attention_config=paged_attention_config,
                 use_paged_kv_cache=use_paged_kv_cache,
             )
-            for i in tqdm(range(self.n_layers))
+            for i in tqdm(range(1))
+            # for i in tqdm(range(self.n_layers))
         ]
         self.norm = DistributedNorm(
             RMSNorm(
