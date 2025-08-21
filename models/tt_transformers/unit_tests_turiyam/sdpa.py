@@ -106,7 +106,7 @@ if __name__ == "__main__":
     print("Opening device")
     device = ttnn.open_device(device_id=0)
 
-    [q_tt, k_tt, v_tt, attn_mask_tt] = generate_qkv_sequence_and_mask(144, device=device)
+    [q_tt, k_tt, v_tt, attn_mask_tt] = generate_qkv_sequence_and_mask(28, device=device)
     print("")
     print("Shapes : (q,k,v,mask)", q_tt.shape, k_tt.shape, v_tt.shape, attn_mask_tt.shape)
     print("DTypes : (q,k,v,mask)", q_tt.dtype, k_tt.dtype, v_tt.dtype, attn_mask_tt.dtype)
