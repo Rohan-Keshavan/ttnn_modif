@@ -75,7 +75,6 @@ class DistributedNorm(LightweightModule):
             x = ttnn.to_memory_config(x, input_mem_cfg)
 
         x = self.norm(x, mode=mode, in_sharded=(mode == "decode"), out_sharded=(mode == "decode"))
-
         # Distributed norm requires a gather
         if self.args.is_distributed_norm(mode):
             x = ttnn.all_gather(x, dim=3, num_links=1, topology=self.args.ccl_topology())
