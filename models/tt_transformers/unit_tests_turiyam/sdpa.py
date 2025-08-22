@@ -3,12 +3,17 @@ import torch
 import ttnn
 
 MODEL_HIDDEN = 8192
+
 N_QHEADS = 64
 N_KVHEADS = 64  # 8 later
 HEAD_DIM = 128
-MAX_SEQ_LEN = 2048
+
+MAX_SEQ_LEN = 1024
+
 TILE_SIZE = 32
-BATCH_SIZE = 32
+BATCH_SIZE = 1
+START_KV_LEN = 26
+ATTN_SCALE = 1 / (HEAD_DIM**0.5)
 
 
 # Reshaped
@@ -37,16 +42,15 @@ def QKVO_generate_and_push_random(device):
 def init_kv_cache(device):
     # (seq_len,n_heads,head_dim) , #Need a current_kv_len
     # kv in row major layout
-    k_cache = torch.zeros(MAX_SEQ_LEN, 1, N_KVHEADS, HEAD_DIM)
+    k_cache = torch.zeros(START_KV_LEN, 1, N_KVHEADS, HEAD_DIM)
     k_tt = ttnn.as_tensor(
         k_cache, device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT
     )
 
-    v_cache = torch.zeros(MAX_SEQ_LEN, 1, N_KVHEADS, HEAD_DIM)
+    v_cache = torch.zeros(START_KV_LEN, 1, N_KVHEADS, HEAD_DIM)
     v_tt = ttnn.as_tensor(
         v_cache, device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT
     )
-
     current_kv_length = 0
     return [k_tt, v_tt, current_kv_length]
 
@@ -85,7 +89,7 @@ def generate_qkv_sequence_and_mask(in_seq_len, device):
     v_tt = ttnn.as_tensor(
         v, device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT
     )
-    attn_mask_tt = ttnn.as_tensor(attn_mask, device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG, dtype=ttnn.int32)
+    attn_mask_tt = ttnn.as_tensor(attn_mask, device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG, dtype=ttnn.float32)
 
     return [q_tt, k_tt, v_tt, attn_mask_tt]
 
@@ -96,10 +100,10 @@ def generate_random_embeddings_and_mask(in_seq_len, device):
     attn_inputs_tt = ttnn.as_tensor(
         attn_input, device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT
     )
-    attn_mask_tt = ttnn.as_tensor(
-        attn_mask, device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT
-    )
-    return [attn_inputs_tt, attn_mask_tt]
+    # attn_mask_tt = ttnn.as_tensor(
+    #    attn_mask, device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT
+    # )
+    return [attn_inputs_tt, attn_mask]
 
 
 if __name__ == "__main__":
@@ -114,6 +118,11 @@ if __name__ == "__main__":
     attn_output = ttnn.transformer.scaled_dot_product_attention(q_tt, k_tt, v_tt, is_causal=True)
     print("SDPA Output : ", attn_output.shape)
 
+    q_tt.deallocate(True)
+    k_tt.deallocate(True)
+    v_tt.deallocate(True)
+    attn_mask_tt.deallocate(True)
+
     print("")
     print("Generating and pushing random QKVO matrices")
     [Q, K, V, O] = QKVO_generate_and_push_random(device=device)
@@ -122,13 +131,16 @@ if __name__ == "__main__":
     print("")
     print("KV Init")
     [K_past, V_past, kv_len] = init_kv_cache(device=device)
-    print("Shape  : (k cache, v cache) : ", K_past.shape, V_past.shape)
+    # print("Shape  : (k cache, v cache) : ", K_past.shape, V_past.shape)
 
     print("")
     print("Generating random embeddings and mask")
     in_seq_len = 16
     E, M = generate_random_embeddings_and_mask(in_seq_len=in_seq_len, device=device)
     print("E , M  : ", E.shape, M.shape)
+    current_sequence_length = K_past.shape[0]
+    draft_sequence_length = E.shape[-2]
+    kv_acces_indices = ttnn.arange(start=0, end=current_sequence_length + draft_sequence_length, dtype=ttnn.int32)
 
     print("Multiplying E , Q : ", E.shape, Q.shape)
     # q_proj = ttnn.matmul(E,Q)
@@ -141,8 +153,76 @@ if __name__ == "__main__":
     v_proj = ttnn.linear(E, V)
     print("Q proj , K proj , V proj : ", q_proj.shape, k_proj.shape, v_proj.shape)
 
-    # q_proj = ttnn.reshape_on_device(q_proj, BATCH_SIZE, in_seq_len , N_QHEADS, HEAD_DIM)
-    # q_proj = ttnn.transpose(q_proj, 1, -2)
-    # print('Q reshaped, headed : ', q_proj.shape)
+    E.deallocate(True)
+    q_proj_reshaped = ttnn.reshape(q_proj, (BATCH_SIZE, in_seq_len, N_QHEADS, HEAD_DIM))
+    q_proj_reshaped = ttnn.transpose(q_proj_reshaped, 0, 1)
+    q_proj.deallocate(True)
 
+    k_proj_reshaped = ttnn.reshape(k_proj, (BATCH_SIZE, in_seq_len, N_QHEADS, HEAD_DIM))
+    k_proj_reshaped = ttnn.transpose(k_proj_reshaped, 0, 1)
+    k_proj.deallocate(True)
+
+    v_proj_reshaped = ttnn.reshape(v_proj, (BATCH_SIZE, in_seq_len, N_QHEADS, HEAD_DIM))
+    v_proj_reshaped = ttnn.transpose(v_proj_reshaped, 0, 1)
+    v_proj.deallocate(True)
+    print("Re heading")
+    print("Reshaped (q , k, v): ", q_proj_reshaped.shape, k_proj_reshaped.shape, v_proj_reshaped.shape)
+
+    print("")
+    kv_len += draft_sequence_length
+
+    # RoPE q and k
+    # RoPE q and k
+
+    # Add to cache, k and v
+    print("K past shape before update : ", K_past.shape)
+    K_past = ttnn.concat([K_past, k_proj_reshaped], dim=0)
+    V_past = ttnn.concat([V_past, v_proj_reshaped], dim=0)
+    print("K past shape after update : ", K_past.shape)
+    v_proj_reshaped.deallocate(True)
+    k_proj_reshaped.deallocate(True)
+    # Add to cache, k and v
+
+    # Reshape and fill attn mask
+    print("")
+    print("Making rectangular mask")
+    M_prefix = torch.ones(BATCH_SIZE, 1, draft_sequence_length, current_sequence_length)
+    M_full = torch.cat([M_prefix, M], dim=-1)
+    M_full = torch.clamp(torch.log(M_full), min=-1e06)
+    M_full = M_full.repeat(1, N_QHEADS, 1, 1)
+    M_full_tt = ttnn.as_tensor(
+        M_full, device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT
+    )
+    print("Rectangular mask shape : ", M_full_tt.shape)
+    # print('Rectangular mask       : ', M_full_tt)
+    # Reshape and fill attn mask
+
+    # Use cache and do attention
+    print("Attn computation")
+    print("QKT current in (q,k)  : ", q_proj_reshaped.shape, K_past.shape)
+    q_proj_reshaped = ttnn.permute(q_proj_reshaped, (1, 2, 0, 3))
+    K_past = ttnn.permute(K_past, (1, 2, 3, 0))
+    print("QKT in reshaped (q,k) : ", q_proj_reshaped.shape, K_past.shape)
+    QKT = ttnn.matmul(q_proj_reshaped, K_past)
+    QKT = QKT * ATTN_SCALE
+    QKT += M_full_tt
+    QKT = ttnn.softmax(QKT, dim=-1)
+    print("QKT out (QKT) : ", QKT.shape)
+    q_proj_reshaped.deallocate(True)
+
+    print("")
+    V_past = ttnn.permute(V_past, (1, 2, 0, 3))
+    print("V past shape   : ", V_past.shape)
+    attn_out = ttnn.matmul(QKT, V_past)
+    print("Attn out shape : ", attn_out.shape)
+    # Use cache and do attention
+
+    print("")
+    attn_out = ttnn.to_layout(attn_out, layout=ttnn.ROW_MAJOR_LAYOUT)
+    attn_out = ttnn.reshape(attn_out, (BATCH_SIZE, draft_sequence_length, MODEL_HIDDEN))
+    attn_out = ttnn.to_layout(attn_out, layout=ttnn.TILE_LAYOUT)
+    print("Attn out reshaped : ", attn_out.shape)
+    layer_out = ttnn.linear(attn_out, O)
+    print("Final out : ", layer_out.shape)
+    # Reshape K and Q
     ttnn.close_device(device)
