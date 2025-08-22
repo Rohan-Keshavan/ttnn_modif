@@ -1,6 +1,7 @@
 import torch
 
 import ttnn
+from models.tt_transformers.tt.rope import RotarySetup
 
 MODEL_HIDDEN = 8192
 
@@ -12,8 +13,13 @@ MAX_SEQ_LEN = 1024
 
 TILE_SIZE = 32
 BATCH_SIZE = 1
+MAX_BATCH_SIZE = 1
 START_KV_LEN = 26
 ATTN_SCALE = 1 / (HEAD_DIM**0.5)
+
+# load model config file
+hf_model_config = {"rope_theta": 500000.0, "original_max_position_embeddings": 8192}
+# load model config file
 
 
 # Reshaped
@@ -110,28 +116,50 @@ if __name__ == "__main__":
     print("Opening device")
     device = ttnn.open_device(device_id=0)
 
-    [q_tt, k_tt, v_tt, attn_mask_tt] = generate_qkv_sequence_and_mask(28, device=device)
+    rope_setup = RotarySetup(
+        device,
+        MAX_BATCH_SIZE,
+        HEAD_DIM,
+        MAX_SEQ_LEN,
+        hf_model_config["rope_theta"],
+        None,
+        hf_model_config["original_max_position_embeddings"],
+    )
+    trans_mats_dict = rope_setup.get_both_trans_mats()
+
+    print("")
+    print("Initializing K and V caches")
+    [K_past, V_past, kv_len] = init_kv_cache(device=device)
+    print("K and V initialized with length : ", kv_len)
+
+    print("")
+    print("Making rotation bases, for 0 to max seq len")
+    start_pos = kv_len
+    draft_seq_len = 28
+    tt_rot_mats_draft = [
+        rope_setup.cos_matrix[:, :, start_pos : start_pos + draft_seq_len, :],
+        rope_setup.sin_matrix[:, :, start_pos : start_pos + draft_seq_len, :],
+    ]
+    print(type(tt_rot_mats_draft), type(tt_rot_mats_draft[0]))
+    print("KV ready for draft sequence")
+
+    """
+    [q_tt, k_tt, v_tt, attn_mask_tt] = generate_qkv_sequence_and_mask(draft_seq_len, device=device)
     print("")
     print("Shapes : (q,k,v,mask)", q_tt.shape, k_tt.shape, v_tt.shape, attn_mask_tt.shape)
     print("DTypes : (q,k,v,mask)", q_tt.dtype, k_tt.dtype, v_tt.dtype, attn_mask_tt.dtype)
     print("PTypes : (q,k,v,mask)", type(q_tt), type(k_tt), type(v_tt), type(attn_mask_tt))
     attn_output = ttnn.transformer.scaled_dot_product_attention(q_tt, k_tt, v_tt, is_causal=True)
     print("SDPA Output : ", attn_output.shape)
-
     q_tt.deallocate(True)
     k_tt.deallocate(True)
     v_tt.deallocate(True)
     attn_mask_tt.deallocate(True)
-
+    """
     print("")
     print("Generating and pushing random QKVO matrices")
     [Q, K, V, O] = QKVO_generate_and_push_random(device=device)
     print("Shapes : (q,k,v,o) : ", Q.shape, K.shape, V.shape, O.shape)
-
-    print("")
-    print("KV Init")
-    [K_past, V_past, kv_len] = init_kv_cache(device=device)
-    # print("Shape  : (k cache, v cache) : ", K_past.shape, V_past.shape)
 
     print("")
     print("Generating random embeddings and mask")
@@ -222,6 +250,7 @@ if __name__ == "__main__":
     attn_out = ttnn.reshape(attn_out, (BATCH_SIZE, draft_sequence_length, MODEL_HIDDEN))
     attn_out = ttnn.to_layout(attn_out, layout=ttnn.TILE_LAYOUT)
     print("Attn out reshaped : ", attn_out.shape)
+
     layer_out = ttnn.linear(attn_out, O)
     print("Final out : ", layer_out.shape)
     # Reshape K and Q
