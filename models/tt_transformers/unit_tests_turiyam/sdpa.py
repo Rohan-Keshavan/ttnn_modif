@@ -9,6 +9,15 @@ MODEL_HIDDEN = 8192
 N_QHEADS = 64
 N_KVHEADS = 64  # 8 later
 HEAD_DIM = 128
+GQA_GROUP_SIZE = int(N_QHEADS / N_KVHEADS)
+# LLaMA 3.3 70B RoPE configuration
+hf_model_config = {
+    "rope_theta": 500000.0,  # Base frequency for RoPE
+    "original_max_position_embeddings": 8192,  # Original context length before scaling
+    "rope_scaling_factor": 8,  # Scaling factor for extended context
+    "max_position_embeddings": 128 * 1024,  # Extended context length (128K)
+}
+# LLaMA 3.3 70B RoPE configuration
 
 # override config file for spec decode
 MAX_SEQ_LEN = 1024
@@ -19,19 +28,6 @@ BATCH_SIZE = 1
 MAX_BATCH_SIZE = 1
 START_KV_LEN = 26
 ATTN_SCALE = 1 / (HEAD_DIM**0.5)
-
-# load model config file
-hf_model_config = {"rope_theta": 500000.0, "original_max_position_embeddings": 8192}
-# load model config file
-
-# LLaMA 3.3 70B RoPE configuration
-# LLaMA 3.3 uses RoPE scaling with factor=8 and original context length=8192
-hf_model_config = {
-    "rope_theta": 500000.0,  # Base frequency for RoPE
-    "original_max_position_embeddings": 8192,  # Original context length before scaling
-    "rope_scaling_factor": 8,  # Scaling factor for extended context
-    "max_position_embeddings": 128 * 1024,  # Extended context length (128K)
-}
 
 
 # Generate random weights : QKVO
@@ -64,16 +60,16 @@ def QKVO_generate_and_push_random(device):
 def init_kv_cache(device):
     # (seq_len,n_heads,head_dim) , #Need a current_kv_len
     # kv in row major layout
-    k_cache = torch.zeros(START_KV_LEN, 1, N_KVHEADS, HEAD_DIM)
+    k_cache = torch.zeros(START_KV_LEN, 1, N_KVHEADS * GQA_GROUP_SIZE, HEAD_DIM)
     k_tt = ttnn.as_tensor(
         k_cache, device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT
     )
 
-    v_cache = torch.zeros(START_KV_LEN, 1, N_KVHEADS, HEAD_DIM)
+    v_cache = torch.zeros(START_KV_LEN, 1, N_KVHEADS * GQA_GROUP_SIZE, HEAD_DIM)
     v_tt = ttnn.as_tensor(
         v_cache, device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT
     )
-    current_kv_length = 0
+    current_kv_length = START_KV_LEN
     return [k_tt, v_tt, current_kv_length]
 
 
@@ -143,54 +139,6 @@ def generate_random_embeddings_and_mask(in_seq_len, device):
 # Generate random inputs, attention mask. Push inputs to device DRAM
 
 
-# Look in the data/models folder for the config file. Or just pick up from the env variable
-def find_llama_models():
-    """
-    Utility function to find LLaMA models in common locations
-
-    Returns:
-        list: List of found LLaMA model paths
-    """
-    import os
-    from pathlib import Path
-
-    found_models = []
-
-    # Check HuggingFace cache directory
-    hf_cache = Path.home() / ".cache" / "huggingface" / "hub"
-    if hf_cache.exists():
-        for model_dir in hf_cache.iterdir():
-            if model_dir.is_dir() and "llama" in model_dir.name.lower():
-                config_file = model_dir / "config.json"
-                if config_file.exists():
-                    found_models.append(str(model_dir))
-
-    # Check current directory
-    current_dir = Path.cwd()
-    for item in current_dir.iterdir():
-        if item.is_dir() and "llama" in item.name.lower():
-            config_file = item / "config.json"
-            if config_file.exists():
-                found_models.append(str(item))
-
-    # Check common model directories
-    common_paths = ["/mnt/MLPerf/tt_dnn-models/llama", "/home/llama-data", "/proj_sw/user_dev/llama"]
-
-    for path in common_paths:
-        if os.path.exists(path):
-            for item in os.listdir(path):
-                item_path = os.path.join(path, item)
-                if os.path.isdir(item_path) and "llama" in item.lower():
-                    config_file = os.path.join(item_path, "config.json")
-                    if os.path.exists(config_file):
-                        found_models.append(item_path)
-
-    return found_models
-
-
-# Look in the data/models folder for the config file. Or just pick up from the env variable
-
-
 # Check llama path
 def check_llama_availability(model_name=None):
     """
@@ -205,27 +153,27 @@ def check_llama_availability(model_name=None):
     import os
     from pathlib import Path
 
+    print("")
     # Get model path from HF_MODEL environment variable
     if model_name is None:
         model_name = os.getenv("HF_MODEL")
         if not model_name:
-            print("❌ HF_MODEL environment variable not set")
-            print("   Please set: export HF_MODEL='/path/to/your/llama/model'")
+            print("HF_MODEL environment variable not set")
+            print("Set: export HF_MODEL='/path/to/your/llama/model'")
             return False
 
     model_path = Path(model_name)
-
-    print(f"🔍 Checking model path: {model_path}")
+    print(f"Checking model path for config.json and .safetensors : {model_path}")
 
     # Check if the directory exists
     if not model_path.exists():
-        print(f"❌ Model directory does not exist: {model_path}")
+        print(f"Model directory does not exist: {model_path}")
         return False
 
     # Check for config.json
     config_file = model_path / "config.json"
     if not config_file.exists():
-        print(f"❌ config.json not found at: {config_file}")
+        print(f"config.json not found at: {config_file}")
         return False
 
     # Check for safetensors files
@@ -234,13 +182,15 @@ def check_llama_availability(model_name=None):
         # Also check for model.safetensors.index.json
         index_file = model_path / "model.safetensors.index.json"
         if not index_file.exists():
-            print(f"❌ No safetensors files found at: {model_path}")
-            print("   Expected: *.safetensors files or model.safetensors.index.json")
+            print(f"No safetensors files found at: {model_path}")
+            print("Expected: *.safetensors files or model.safetensors.index.json")
             return False
         else:
-            print(f"✅ Found safetensors index file: {index_file}")
+            print(f" Found safetensors index file: {index_file}")
 
-    print(f"✅ Found local model weights at: {model_path}")
+    print("")
+    print("Search summary")
+    print(f"Found local model weights at: {model_path}")
     print(f"   - Config file: {config_file}")
     if safetensor_files:
         print(f"   - Safetensors files: {len(safetensor_files)} found")
@@ -255,12 +205,11 @@ def check_llama_availability(model_name=None):
 
         with open(config_file, "r") as f:
             config = json.load(f)
-
-        print(f"   - Model type: {config.get('model_type', 'N/A')}")
-        print(f"   - Hidden size: {config.get('hidden_size', 'N/A')}")
-        print(f"   - Num layers: {config.get('num_hidden_layers', 'N/A')}")
-        print(f"   - Num heads: {config.get('num_attention_heads', 'N/A')}")
-        print(f"   - Num KV heads: {config.get('num_key_value_heads', 'N/A')}")
+        print(f"   - Model type     : {config.get('model_type', 'N/A')}")
+        print(f"   - Hidden size    : {config.get('hidden_size', 'N/A')}")
+        print(f"   - Num layers     : {config.get('num_hidden_layers', 'N/A')}")
+        print(f"   - Num heads      : {config.get('num_attention_heads', 'N/A')}")
+        print(f"   - Num KV heads   : {config.get('num_key_value_heads', 'N/A')}")
         return True
     except Exception as e:
         print(f"   - Config read error: {e}")
@@ -298,42 +247,46 @@ def load_llama_attention_weights(device, model_name=None, layer_idx=0):
         import os
         from pathlib import Path
 
-        import torch
         from transformers import AutoModelForCausalLM
 
         # Get model path from HF_MODEL environment variable
         if model_name is None:
             model_name = os.getenv("HF_MODEL")
+            """
             if not model_name:
                 raise ValueError(
                     "HF_MODEL environment variable not set. Please set: export HF_MODEL='/path/to/your/llama/model'"
-                )
+               )
+            """
 
         model_path = Path(model_name)
 
-        print(f"Loading model from local weights: {model_path}")
+        print("")
+        print(f"Loading model from local weights: {model_path} , loading on to cpu")
 
-        # Verify the model path exists and has required files
-        if not model_path.exists():
-            raise FileNotFoundError(f"Model directory does not exist: {model_path}")
+        """
+        #Verify the model path exists and has required files
+        #if not model_path.exists():
+        #    raise FileNotFoundError(f"Model directory does not exist: {model_path}")
 
         config_file = model_path / "config.json"
-        if not config_file.exists():
-            raise FileNotFoundError(f"config.json not found at: {config_file}")
+        #if not config_file.exists():
+        #    raise FileNotFoundError(f"config.json not found at: {config_file}")
 
         # Check for safetensors files
         safetensor_files = list(model_path.glob("*.safetensors"))
         index_file = model_path / "model.safetensors.index.json"
 
-        if not safetensor_files and not index_file.exists():
-            raise FileNotFoundError(f"No safetensors files found at: {model_path}")
+        #if not safetensor_files and not index_file.exists():
+        #    raise FileNotFoundError(f"No safetensors files found at: {model_path}")
 
-        print(f"✅ Verified model files at: {model_path}")
+        print(f" Verified model files at: {model_path}")
         print(f"   - Config: {config_file}")
         if safetensor_files:
             print(f"   - Safetensors: {len(safetensor_files)} files")
         if index_file.exists():
             print(f"   - Index: {index_file}")
+        """
 
         # Load the model from local path
         model = AutoModelForCausalLM.from_pretrained(
@@ -344,8 +297,8 @@ def load_llama_attention_weights(device, model_name=None, layer_idx=0):
             local_files_only=True,  # Only use local files, no downloads
         )
 
-        print("Model loaded successfully from local weights")
-
+        print("Model loaded successfully from local weights.")
+        print(f"Obtaining weights of interest at layer : {layer_idx}")
         # Extract attention weights for the specific layer
         attention_weights = {}
 
@@ -379,18 +332,19 @@ def load_llama_attention_weights(device, model_name=None, layer_idx=0):
                     raise AttributeError(f"Could not find weight for {name} at path {key}")
 
         # Get model info
+        print("Overwriting default model config...")
         config = model.config
         print(f"Model configuration:")
-        print(f"  - Hidden dimension: {config.hidden_size}")
-        print(f"  - Number of heads: {config.num_attention_heads}")
-        print(f"  - Number of KV heads: {config.num_key_value_heads}")
-        print(f"  - Head dimension: {config.hidden_size // config.num_attention_heads}")
-        print(f"  - Number of layers: {config.num_hidden_layers}")
+        print(f"  - Model hidden: {config.hidden_size}")
+        print(f"  - NQ heads    : {config.num_attention_heads}")
+        print(f"  - NKV heads   : {config.num_key_value_heads}")
+        print(f"  - Head dims   : {config.hidden_size // config.num_attention_heads}")
+        print(f"  - Layers      : {config.num_hidden_layers}")
 
         # Convert weights to TT-Metal tensors and push to device
-        print("Converting weights to TT-Metal tensors...")
+        print("Converting weights to TT tensors on DRAM...")
         tt_weights = {}
-        print("Attn weight items : ", attention_weights.items())
+        # print("Attn weight keys : ", attention_weights.keys())
         for name, weight in attention_weights.items():
             # Convert to bfloat16 and push to device
             weight_tt = ttnn.from_torch(
@@ -517,55 +471,14 @@ def apply_custom_rope_to_qk(
 
 # Llama RoPE, no boundary conditions/rescaling
 
+
 if __name__ == "__main__":
     print("Opening device")
     device = ttnn.open_device(device_id=0)
 
-    rope_setup = RotarySetup(
-        device,
-        MAX_BATCH_SIZE,
-        HEAD_DIM,
-        MAX_SEQ_LEN,
-        hf_model_config["rope_theta"],
-        None,
-        hf_model_config["original_max_position_embeddings"],
-    )
-    trans_mats_dict = rope_setup.get_both_trans_mats()
-
-    print("")
-    print("Initializing K and V caches")
-    [K_past, V_past, kv_len] = init_kv_cache(device=device)
-    print("K and V initialized with length : ", kv_len)
-
-    print("")
-    print("Making rotation bases, for 0 to max seq len")
-    start_pos = kv_len
-    draft_seq_len = 28
-    tt_rot_mats_draft = [
-        rope_setup.cos_matrix[:, :, start_pos : start_pos + draft_seq_len, :],
-        rope_setup.sin_matrix[:, :, start_pos : start_pos + draft_seq_len, :],
-    ]
-    print(type(tt_rot_mats_draft), type(tt_rot_mats_draft[0]))
-    print("KV ready for draft sequence")
-
-    """
-    [q_tt, k_tt, v_tt, attn_mask_tt] = generate_qkv_sequence_and_mask(draft_seq_len, device=device)
-    print("")
-    print("Shapes : (q,k,v,mask)", q_tt.shape, k_tt.shape, v_tt.shape, attn_mask_tt.shape)
-    print("DTypes : (q,k,v,mask)", q_tt.dtype, k_tt.dtype, v_tt.dtype, attn_mask_tt.dtype)
-    print("PTypes : (q,k,v,mask)", type(q_tt), type(k_tt), type(v_tt), type(attn_mask_tt))
-    attn_output = ttnn.transformer.scaled_dot_product_attention(q_tt, k_tt, v_tt, is_causal=True)
-    print("SDPA Output : ", attn_output.shape)
-    q_tt.deallocate(True)
-    k_tt.deallocate(True)
-    v_tt.deallocate(True)
-    attn_mask_tt.deallocate(True)
-    """
-    print("")
-    print("Checking LLaMA 3.3 70B availability...")
-
     # Check if the model is available before attempting to load
-    # Check if the model specified in HF_MODEL environment variable is available
+    print("")
+    print("Looking for available Llama models...")
     if check_llama_availability():
         # Configure which layer to load (0-indexed, so layer 1 = index 1)
         target_layer_idx = 1  # Change this to load different layers
@@ -581,13 +494,15 @@ if __name__ == "__main__":
         V = attention_weights["v_proj"]  # [head_dim * n_kv_heads, hidden_dim]
         O = attention_weights["o_proj"]  # [hidden_dim, hidden_dim]
 
-        print("✅ Loaded real LLaMA attention weights:")
+        print("")
+        print("Loaded real LLaMA attention weights.")
         print(f"Q: {Q.shape}, K: {K.shape}, V: {V.shape}, O: {O.shape}")
+        print("")
 
         # Update global parameters from config if available
         if result["config"] is not None:
             config = result["config"]
-            print("🔄 Updating model parameters from config file...")
+            print("Updating model parameters from config file...")
 
             # Update global variables (these are module-level variables)
             MODEL_HIDDEN = config.hidden_size
@@ -598,31 +513,50 @@ if __name__ == "__main__":
             # Store the entire model config for future use
             hf_model_config = config
 
-            print(f"✅ Updated model parameters:")
-            print(f"   - Hidden dimension: {MODEL_HIDDEN}")
-            print(f"   - Number of query heads: {N_QHEADS}")
-            print(f"   - Number of KV heads: {N_KVHEADS}")
-            print(f"   - Head dimension: {HEAD_DIM}")
-            print(f"   - RoPE theta: {getattr(config, 'rope_theta', 'N/A')}")
-            print(f"   - RoPE scaling factor: {getattr(config, 'rope_scaling_factor', 'N/A')}")
-            print(f"   - Model type: {getattr(config, 'model_type', 'N/A')}")
-            print(f"   - Total layers: {getattr(config, 'num_hidden_layers', 'N/A')}")
+            print(f"Updated model parameters:")
+            print(f"   - Hidden dimension       : {MODEL_HIDDEN}")
+            print(f"   - Number of query heads  : {N_QHEADS}")
+            print(f"   - Number of KV heads     : {N_KVHEADS}")
+            print(f"   - Head dimension         : {HEAD_DIM}")
+            print(f"   - RoPE theta             : {getattr(config, 'rope_theta', 'N/A')}")
+            print(f"   - RoPE scaling factor    : {getattr(config, 'rope_scaling_factor', 'N/A')}")
+            print(f"   - Model type             : {getattr(config, 'model_type', 'N/A')}")
+            print(f"   - Total layers           : {getattr(config, 'num_hidden_layers', 'N/A')}")
 
             # Now hf_model_config contains the full model config - access any parameter like:
             # hf_model_config.hidden_size, hf_model_config.num_attention_heads, etc.
         else:
-            print("⚠️  No config available, using hardcoded parameters")
+            print("   No config available, using hardcoded parameters")
             print("   - Using fallback RoPE config from hf_model_config")
+
     else:
-        print("⚠️  Using random weights as fallback...")
+        print("Using random weights as fallback...")
 
         # Fallback to random weights
         random_weights = QKVO_generate_and_push_random(device)
         Q, K, V, O = random_weights
 
-        print("📝 Using random attention weights:")
+        print("Using random attention weights:")
         print(f"Q: {Q.shape}, K: {K.shape}, V: {V.shape}, O: {O.shape}")
+    # Check if the model is available before attempting to load
+    GQA_GROUP_SIZE = int(N_QHEADS / N_KVHEADS)
+    rope_setup = RotarySetup(
+        device,
+        MAX_BATCH_SIZE,
+        HEAD_DIM,
+        MAX_SEQ_LEN,
+        hf_model_config.rope_theta,
+        None,
+        hf_model_config.rope_scaling["original_max_position_embeddings"],
+    )
+    trans_mats_dict = rope_setup.get_both_trans_mats()
 
+    print("")
+    print("Initializing K and V caches")
+    [K_past, V_past, kv_len] = init_kv_cache(device=device)
+    print("K and V initialized with length : ", kv_len)
+
+    # Input simulate and prep
     print("")
     print("Generating random embeddings and mask")
     in_seq_len = 16
@@ -631,7 +565,11 @@ if __name__ == "__main__":
     current_sequence_length = K_past.shape[0]
     draft_sequence_length = E.shape[-2]
     kv_acces_indices = ttnn.arange(start=0, end=current_sequence_length + draft_sequence_length, dtype=ttnn.int32)
+    # Input simulate and prep
 
+    print("")
+    """
+    #Model foward
     print("Multiplying E , Q : ", E.shape, Q.shape)
     # q_proj = ttnn.matmul(E,Q)
     q_proj = ttnn.linear(E, Q)
@@ -642,8 +580,66 @@ if __name__ == "__main__":
     # v_proj = ttnn.matmul(E,V)
     v_proj = ttnn.linear(E, V)
     print("Q proj , K proj , V proj : ", q_proj.shape, k_proj.shape, v_proj.shape)
+    """
+    # Model forward
 
+    # RoPE current
+    print("")
+    print("Making rotation bases, for 0 to max seq len")
+    start_pos = kv_len
+    tt_rot_mats_draft = [
+        rope_setup.cos_matrix[:, :, start_pos : start_pos + in_seq_len, :],
+        rope_setup.sin_matrix[:, :, start_pos : start_pos + in_seq_len, :],
+    ]
+    print(type(tt_rot_mats_draft), type(tt_rot_mats_draft[0]))
+    print("RoPE ready for draft sequence")
+    # RoPE current
+
+    # QKV projection
+    # GQA Weight Expansion: Expand K and V weights to match Q head count
+    print("GQA Weight Expansion: Expanding K and V weights for grouped query attention...")
+
+    # Current shapes:
+    # Q: [1, 1, 4096, 4096] (32 heads × 128 dim, 4096)
+    # K: [1, 1, 1024, 4096] (8 heads × 128 dim, 4096)
+    # V: [1, 1, 1024, 4096] (8 heads × 128 dim, 4096)
+
+    # We need to expand K and V to [1, 1, 4096, 4096] by repeating each KV head
+    # Each KV head serves GQA_GROUP_SIZE query heads
+
+    # Reshape K and V to separate heads for expansion
+    K_reshaped = ttnn.reshape(K, (1, 1, N_KVHEADS, HEAD_DIM, MODEL_HIDDEN))
+    V_reshaped = ttnn.reshape(V, (1, 1, N_KVHEADS, HEAD_DIM, MODEL_HIDDEN))
+
+    # Repeat each KV head GQA_GROUP_SIZE times along the head dimension
+    K_expanded = ttnn.repeat(K_reshaped, [1, 1, GQA_GROUP_SIZE, 1, 1])  # [1, 1, 32, 128, 4096]
+    V_expanded = ttnn.repeat(V_reshaped, [1, 1, GQA_GROUP_SIZE, 1, 1])  # [1, 1, 32, 128, 4096]
+
+    # Reshape back to original format for linear projection
+    K_expanded_flat = ttnn.reshape(K_expanded, (1, 1, N_QHEADS * HEAD_DIM, MODEL_HIDDEN))
+    V_expanded_flat = ttnn.reshape(V_expanded, (1, 1, N_QHEADS * HEAD_DIM, MODEL_HIDDEN))
+
+    print(f"K weight expanded: {K.shape} -> {K_expanded_flat.shape}")
+    print(f"V weight expanded: {V.shape} -> {V_expanded_flat.shape}")
+    print(f"GQA group size: {GQA_GROUP_SIZE} (each KV head serves {GQA_GROUP_SIZE} query heads)")
+    K_reshaped.deallocate(True)
+    K_expanded.deallocate(True)
+    V_reshaped.deallocate(True)
+    V_expanded.deallocate(True)
+
+    # Now all weights have the same head dimension for linear projection
+    print("Multiplying E , Q : ", E.shape, Q.shape)
+    q_proj = ttnn.linear(E, Q)
+    print("Multiplying E , K : ", E.shape, K_expanded_flat.shape)
+    k_proj = ttnn.linear(E, K_expanded_flat)
+    print("Multiplying E , V : ", E.shape, V_expanded_flat.shape)
+    v_proj = ttnn.linear(E, V_expanded_flat)
+    print("Q proj , K proj , V proj : ", q_proj.shape, k_proj.shape, v_proj.shape)
     E.deallocate(True)
+    # What else can I deallocate ?
+    # Mark one time and data dependent computation
+    # QKV projection
+
     q_proj_reshaped = ttnn.reshape(q_proj, (BATCH_SIZE, in_seq_len, N_QHEADS, HEAD_DIM))
     q_proj_reshaped = ttnn.transpose(q_proj_reshaped, 0, 1)
     q_proj.deallocate(True)
@@ -679,9 +675,9 @@ if __name__ == "__main__":
         draft_position_indices,  # Pass actual position indices
         device=device,
         head_dim=HEAD_DIM,  # Use the model's head dimension
-        theta=hf_model_config["rope_theta"],  # LLaMA 3.3 RoPE base frequency
-        scale_factor=hf_model_config["rope_scaling_factor"],  # LLaMA 3.3 RoPE scaling
-        orig_context_len=hf_model_config["original_max_position_embeddings"],  # Original context length
+        theta=hf_model_config.rope_theta,  # LLaMA 3.3 RoPE base frequency
+        scale_factor=hf_model_config.rope_scaling["factor"],  # LLaMA 3.3 RoPE scaling
+        orig_context_len=hf_model_config.rope_scaling["original_max_position_embeddings"],  # Original context length
     )
 
     print("Custom RoPE applied successfully")
@@ -746,5 +742,7 @@ if __name__ == "__main__":
 
     layer_out = ttnn.linear(attn_out, O)
     print("Final out : ", layer_out.shape)
-    # Reshape K and Q
+    # Model forward
+
+    print("Closing device : ", device)
     ttnn.close_device(device)
