@@ -356,25 +356,21 @@ class AttentionBlock:
 
         # Step 2: QKV Projection
         # q_proj, k_proj, v_proj = self._project_qkv(input_tokens, K_expanded, V_expanded)
+
         q_proj, k_proj, v_proj = self._project_qkv(input_tokens, reshape_and_expand=True)
         intermediates["q_proj"] = q_proj
         intermediates["k_proj"] = k_proj
         intermediates["v_proj"] = v_proj
-        print("Project - reshape : ", q_proj.shape, k_proj.shape, v_proj.shape)
-        # ttnn.close_device(self.device)
-        # exit(0)
+        return q_proj, intermediates
 
         # Step 3: Reshape to separate heads
         # q_reshaped, k_reshaped, v_reshaped = self._reshape_to_heads(q_proj, k_proj, v_proj)
-        # print(q_reshaped.shape,k_reshaped.shape,v_reshaped.shape)
-        # ttnn.close_device(self.device)
-        # exit(0)
+
         # Step 4: Apply RoPE
         q_rotated, k_rotated = self._apply_rope(q_proj, k_proj, position_indices)
         # q_rotated, k_rotated = self._apply_rope(q_reshaped, k_reshaped, position_indices)
 
         # Step 5: Update KV cache (after computing attention)
-        #        self._update_kv_cache(k_rotated, v_reshaped)
         self._update_kv_cache(k_rotated, v_proj)
         print(f"KV cache updated: {self.K_past.shape}, {self.V_past.shape}")
         print(f"Current cache length: {self.kv_len}")
@@ -457,7 +453,7 @@ class AttentionBlock:
         )
 
         print(f"QKV shapes: {q_proj.shape}, {k_proj.shape}, {v_proj.shape}")
-        if reshape_and_expand:
+        if reshape_and_expand and 0:
             q_proj = ttnn.reshape(q_proj, (q_proj.shape[0], q_proj.shape[1], self.N_QHEADS, self.HEAD_DIM))
             q_proj = ttnn.permute(q_proj, (1, 0, 2, 3))
 
@@ -469,11 +465,6 @@ class AttentionBlock:
             v_proj = ttnn.permute(v_proj, (1, 0, 2, 3))
             v_proj = ttnn.repeat(v_proj, [1, 1, self.GQA_GROUP_SIZE, 1])
 
-        # Cleanup expanded weights
-        #        K_expanded.deallocate(True)
-        #        V_expanded.deallocate(True)
-        # ttnn.close_device(self.device)
-        # exit(0)
         return q_proj, k_proj, v_proj
 
     def _reshape_to_heads(self, q_proj, k_proj, v_proj):
@@ -652,7 +643,6 @@ class AttentionBlock:
             v_current: Current V tokens [seq_len, batch, heads, head_dim]
             attention_mask: Optional attention mask
         """
-        print("Computing attention with cache handling...")
         """
         if self.kv_len == 0:
             # First forward pass: use only current tokens
@@ -776,7 +766,6 @@ class AttentionBlock:
         attn_out = ttnn.to_layout(attn_out, layout=ttnn.ROW_MAJOR_LAYOUT)
         attn_out = ttnn.reshape(attn_out, (self.BATCH_SIZE, -1, self.MODEL_HIDDEN))
         attn_out = ttnn.to_layout(attn_out, layout=ttnn.TILE_LAYOUT)
-
         output = ttnn.linear(attn_out, self.O)
 
         print(f"Final output: {output.shape}")
@@ -813,7 +802,7 @@ class AttentionBlock:
 
         # Reset to initial capacity
         self.init_kv_cache(max_capacity=self.max_capacity)
-        print("✅ KV cache reset to initial capacity")
+        print("KV cache reset.")
 
     def resize_kv_cache(self, new_capacity):
         """
@@ -1026,14 +1015,8 @@ def rms_norm(x, norm_weights):
 
 
 if __name__ == "__main__":
-    interest = "decoder_0.pt"
     root = os.getcwd()
     ref_data_path = os.path.join(root, "reference_data")
-
-    # ref_data_file = os.path.join(ref_data_path, interest)
-    # ref_data = torch.load(ref_data_file)
-    # example         = ref_data[len(ref_data)-1]
-
     # Load reference example
     example = torch.load(os.path.join(ref_data_path, "example_with_intermediates.pt"))
     # Load reference example
@@ -1082,10 +1065,9 @@ if __name__ == "__main__":
         # Forward pass
 
         # Verify intermediates
-        tt_q_proj = ttnn.to_torch(ttnn.from_device(ttnn.permute(tt_intermediates["q_proj"], (1, 2, 0, 3)))).to(
-            dtype=torch.float
-        )
+        tt_q_proj = ttnn.to_torch(ttnn.from_device(tt_intermediates["q_proj"])).to(dtype=torch.float)
         torch_q_proj = example["outputs/intermediates"]["q_proj"]
+        print("Torch q proj shape : ", torch_q_proj.shape)
         errors = torch.abs((torch_q_proj - tt_q_proj))
         mean_error = torch.mean(errors)
         max_error = torch.max(errors)
@@ -1094,6 +1076,8 @@ if __name__ == "__main__":
             torch.allclose(torch_q_proj, tt_q_proj, atol=1e-04, rtol=1e-02),
         )
         print("Mean and Max L1 errors q_projections : ", mean_error, max_error)
+        ttnn.close_device(device)
+        exit(0)
         # Verify intermediates
 
         # Get reference output
