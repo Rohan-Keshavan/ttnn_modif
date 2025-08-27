@@ -202,6 +202,21 @@ def generate_random_weights(device, model_hidden, n_qheads, n_kvheads, head_dim)
     return {"q_proj": Q_tt, "k_proj": K_tt, "v_proj": V_tt, "o_proj": O_tt}
 
 
+def generate_random_embeddings_and_mask(batch_size, in_seq_len, model_hidden, device):
+    attn_input = torch.rand(batch_size, in_seq_len, model_hidden)
+    attn_mask = torch.rand(batch_size, 1, in_seq_len, in_seq_len)
+    attn_inputs_tt = ttnn.as_tensor(
+        attn_input, device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT
+    )
+    return [attn_inputs_tt, attn_mask]
+
+
+def generate_random_embeddings_and_mask_torch(batch_size, in_seq_len, model_hidden, device):
+    attn_input = torch.rand(batch_size, in_seq_len, model_hidden)
+    attn_mask = torch.rand(batch_size, 1, in_seq_len, in_seq_len)
+    return [attn_input, attn_mask]
+
+
 def generate_random_embeddings(seq_len, model_hidden, batch_size=1, device=None):
     """
     Generate random token embeddings for testing.
