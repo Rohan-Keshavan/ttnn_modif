@@ -1072,12 +1072,10 @@ if __name__ == "__main__":
         mean_error = torch.mean(errors)
         max_error = torch.max(errors)
         print(
-            "torch allclose (atol 1e-04, rtol 1e-05) output : ",
+            "torch allclose (atol 1e-04, rtol 1e-02) output : ",
             torch.allclose(torch_q_proj, tt_q_proj, atol=1e-04, rtol=1e-02),
         )
         print("Mean and Max L1 errors q_projections : ", mean_error, max_error)
-        ttnn.close_device(device)
-        exit(0)
         # Verify intermediates
 
         # Get reference output
@@ -1087,7 +1085,7 @@ if __name__ == "__main__":
         mean_error = torch.mean(errors)
         max_error = torch.max(errors)
         print(
-            "torch allclose (atol 1e-04, rtol 1e-05) output : ",
+            "torch allclose (atol 1e-04, rtol 1e-02) output : ",
             torch.allclose(torch_output, tt_output, atol=1e-04, rtol=1e-02),
         )
         print("Mean and Max L1 errors : ", mean_error, max_error)

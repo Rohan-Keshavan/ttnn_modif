@@ -44,7 +44,6 @@ def load_attn_weights(layer_idx=0):
             print(f"Loaded {name} weight: {weight.shape}")
             attention_weights[name] = weight
         else:
-            # Try alternative access patterns
             if hasattr(current, "data"):
                 weight = current.data
                 print(f"Loaded {name} weight (direct data): {weight.shape}")
@@ -68,14 +67,13 @@ def load_reference_inputs():
     ref_data_path = os.path.join(root, "reference_data")
     example = torch.load(os.path.join(ref_data_path, "example_with_intermediates.pt"))
     ref_inputs = example["args/hidden_states_post_norm"]
-    print("Reference data loaded , items : ", example.keys())
+    print("Reference data loaded")
     return example, ref_inputs
 
 
 if __name__ == "__main__":
     print("")
     attention_weights_torch = load_attn_weights()
-    #    print(attention_weights_torch.keys())
 
     device = ttnn.open_device(device_id=0)
 
@@ -114,6 +112,7 @@ if __name__ == "__main__":
         fp32_dest_acc_en=True,
         packer_l1_acc=True,
     )
+    out_data_dype = ttnn.float32
 
     reference_inputs = ttnn.from_torch(
         reference_inputs,
@@ -132,6 +131,7 @@ if __name__ == "__main__":
         memory_config=ttnn.DRAM_MEMORY_CONFIG,
     )
     print("q projection matrix pushed to device. Shape : ", Q_tt.shape)
+
     K_tt = ttnn.from_torch(
         attention_weights_torch["k_proj"],
         device=device,
@@ -140,6 +140,7 @@ if __name__ == "__main__":
         memory_config=ttnn.DRAM_MEMORY_CONFIG,
     )
     print("k projection matrix pushed to device. Shape : ", K_tt.shape)
+
     V_tt = ttnn.from_torch(
         attention_weights_torch["v_proj"],
         device=device,
@@ -153,11 +154,11 @@ if __name__ == "__main__":
         reference_inputs,
         Q_tt,
         transpose_b=True,
-        dtype=ttnn.bfloat16,
+        dtype=out_data_dype,
         memory_config=ttnn.DRAM_MEMORY_CONFIG,
         compute_kernel_config=compute_kernel_config_hifi4,
     )
-    tt_output_q_torch = ttnn.to_torch(ttnn.from_device(tt_output_q), dtype=torch.bfloat16)
+    tt_output_q_torch = ttnn.to_torch(ttnn.from_device(tt_output_q))
     tt_output_q_torch = tt_output_q_torch.to(dtype=torch.float)
     print("TT output computed. Copied to cpu as torch.")
 
@@ -165,11 +166,11 @@ if __name__ == "__main__":
         reference_inputs,
         K_tt,
         transpose_b=True,
-        dtype=ttnn.bfloat16,
+        dtype=out_data_dype,
         memory_config=ttnn.DRAM_MEMORY_CONFIG,
         compute_kernel_config=compute_kernel_config_hifi4,
     )
-    tt_output_k_torch = ttnn.to_torch(ttnn.from_device(tt_output_k), dtype=torch.bfloat16)
+    tt_output_k_torch = ttnn.to_torch(ttnn.from_device(tt_output_k))
     tt_output_k_torch = tt_output_k_torch.to(dtype=torch.float)
     print("TT output computed. Copied to cpu as torch.")
 
@@ -177,30 +178,51 @@ if __name__ == "__main__":
         reference_inputs,
         V_tt,
         transpose_b=True,
-        dtype=ttnn.bfloat16,
+        dtype=out_data_dype,
         memory_config=ttnn.DRAM_MEMORY_CONFIG,
         compute_kernel_config=compute_kernel_config_hifi4,
     )
-    tt_output_v_torch = ttnn.to_torch(ttnn.from_device(tt_output_v), dtype=torch.bfloat16)
+    tt_output_v_torch = ttnn.to_torch(ttnn.from_device(tt_output_v))
     tt_output_v_torch = tt_output_v_torch.to(dtype=torch.float)
     print("TT output computed. Copied to cpu as torch.")
+
+    atol = 1e-04
+    rtol = 1e-02
 
     error_pointwise = torch.abs((torch_output_q - tt_output_q_torch))
     mean_error = torch.mean(error_pointwise)
     max_error = torch.max(error_pointwise)
     print("Mean error , Max error (q) : ", mean_error, max_error)
-    print("Allclose   : ", torch.allclose(tt_output_q_torch, torch_output_q, atol=1e-04, rtol=1e-02))
+    print("Allclose   : ", torch.allclose(tt_output_q_torch, torch_output_q, atol=atol, rtol=rtol))
+    # elementwise check (like allclose does internally)
+    mask = torch.abs(torch_output_q - tt_output_q_torch) > (atol + rtol * torch.abs(tt_output_q_torch))
+    # fraction (or %) of elements failing the criterion
+    fail_fraction = mask.float().mean().item()
+    fail_percent = fail_fraction * 100
+    print("Fail percent : ", fail_percent)
 
     error_pointwise = torch.abs((torch_output_k - tt_output_k_torch))
     mean_error = torch.mean(error_pointwise)
     max_error = torch.max(error_pointwise)
     print("Mean error , Max error (k) : ", mean_error, max_error)
-    print("Allclose   : ", torch.allclose(tt_output_k_torch, torch_output_k, atol=1e-04, rtol=1e-02))
+    print("Allclose   : ", torch.allclose(tt_output_k_torch, torch_output_k, atol=atol, rtol=rtol))
+    # elementwise check (like allclose does internally)
+    mask = torch.abs(torch_output_k - tt_output_k_torch) > (atol + rtol * torch.abs(tt_output_k_torch))
+    # fraction (or %) of elements failing the criterion
+    fail_fraction = mask.float().mean().item()
+    fail_percent = fail_fraction * 100
+    print("Fail percent : ", fail_percent)
 
     error_pointwise = torch.abs((torch_output_v - tt_output_v_torch))
     mean_error = torch.mean(error_pointwise)
     max_error = torch.max(error_pointwise)
     print("Mean error , Max error (v) : ", mean_error, max_error)
-    print("Allclose   : ", torch.allclose(tt_output_v_torch, torch_output_v, atol=1e-04, rtol=1e-02))
+    print("Allclose   : ", torch.allclose(tt_output_v_torch, torch_output_v, atol=atol, rtol=rtol))
+    # elementwise check (like allclose does internally)
+    mask = torch.abs(torch_output_v - tt_output_v_torch) > (atol + rtol * torch.abs(tt_output_v_torch))
+    # fraction (or %) of elements failing the criterion
+    fail_fraction = mask.float().mean().item()
+    fail_percent = fail_fraction * 100
+    print("Fail percent : ", fail_percent)
 
     ttnn.close_device(device)
