@@ -711,11 +711,15 @@ class LlamaAttention(nn.Module):
         intermediates["q_proj"] = query_states
         intermediates["k_proj"] = key_states
         intermediates["v_proj"] = value_states
-        print("qkv shapes : ", query_states.shape, key_states.shape, value_states.shape)
+        print("qkv shapes (post qkv) : ", query_states.shape, key_states.shape, value_states.shape)
 
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        print("qkv shapes (pre-rope) : ", query_states.shape, key_states.shape, value_states.shape)
+
+        intermediates["q_pre_rope"] = query_states
+        intermediates["k_pre_rope"] = key_states
 
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
@@ -726,9 +730,10 @@ class LlamaAttention(nn.Module):
         else:
             cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        print("qkv shapes (post-rope): ", query_states.shape, key_states.shape, value_states.shape)
 
-        intermediates["q_rope"] = query_states
-        intermediates["k_rope"] = key_states
+        intermediates["q_post_rope"] = query_states
+        intermediates["k_post_rope"] = key_states
         # [MODIFIED] Using KVCache mechanism for preallocated GPU memory optimization
         # past_key_value is utilized to leverage previously computed key and value states.
         # If past_key_value is available, reuse the states for k, v, and self_attention.
@@ -1548,3 +1553,4 @@ if __name__ == "__main__":
     example["outputs/ref_output"] = y
 
     torch.save(example, os.path.join(ref_data_path, "example_with_intermediates.pt"))
+    print("Data saved.")

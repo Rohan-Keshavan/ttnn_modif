@@ -112,7 +112,7 @@ if __name__ == "__main__":
         fp32_dest_acc_en=True,
         packer_l1_acc=True,
     )
-    out_data_dype = ttnn.float32
+    out_data_dype = ttnn.bfloat16
 
     reference_inputs = ttnn.from_torch(
         reference_inputs,
