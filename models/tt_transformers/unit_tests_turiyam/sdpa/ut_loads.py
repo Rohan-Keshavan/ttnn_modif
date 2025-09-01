@@ -95,7 +95,25 @@ if __name__ == "__main__":
     print("Extended   (Torch cosines and sines) : ", torch_cosines_full.shape, torch_sines_full.shape)
     print("Extended   (Torch cosines and sines) : ", torch_cosines_full.dtype, torch_sines_full.dtype)
 
-    # torch_cosines_full  = torch_cosines_full.to(torch.bfloat16)
-    # torch_sines_full    = torch_sines_full.to(torch.bfloat16)
     tt_cosines_full = ttnn.from_torch(torch_cosines_full, device=device, layout=ttnn.TILE_LAYOUT, dtype=ttnn.float32)
     tt_sines_full = ttnn.from_torch(torch_sines_full, device=device, layout=ttnn.TILE_LAYOUT, dtype=ttnn.float32)
+    trans_mats = ttnn.to_torch(ttnn.from_device(trans_mats_dict["prefill"]))
+    trans_mats = ttnn.from_torch(
+        trans_mats, device=device, dtype=ttnn.float32, memory_config=ttnn.DRAM_MEMORY_CONFIG, layout=ttnn.TILE_LAYOUT
+    )
+    print("TT sines and cosines : ", tt_cosines_full.dtype, tt_sines_full.dtype)
+    print("TT Transmats         : ", trans_mats.dtype)
+
+    rope_in_q_tt = ttnn.from_torch(
+        rope_in_q, device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG, layout=ttnn.TILE_LAYOUT
+    )
+    rope_in_k_tt = ttnn.from_torch(
+        rope_in_k, device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG, layout=ttnn.TILE_LAYOUT
+    )
+    q_rotated = ttnn.experimental.rotary_embedding_llama(
+        rope_in_q_tt, cos_cache=tt_cosines_full, sin_cache=tt_sines_full, trans_mat=trans_mats, is_decode_mode=False
+    )
+    k_rotated = ttnn.experimental.rotary_embedding_llama(
+        rope_in_k_tt, cos_cache=tt_cosines_full, sin_cache=tt_sines_full, trans_mat=trans_mats, is_decode_mode=False
+    )
+    print("Shape post Rope (Q,K) : ", q_rotated.shape, k_rotated.shape)

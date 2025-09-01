@@ -12,11 +12,14 @@ import ttnn
 TORCH_IN_DTYPE = torch.bfloat16
 TORCH_OUT_DTYPE = torch.bfloat16
 TT_OUT_DTYPE = ttnn.bfloat16
+
 TILE_SIZE = 32
 MODEL_HIDDEN = 4096
+N_ATTENTION_HEADS = 32
 GQA_GROUP_SIZE = 4
-tile_padded_batch_rows = TILE_SIZE
-OBSERVE_SEQ_LEN = 32
+OBSERVE_SEQ_LEN = 60
+
+inputs_from = "random"
 
 
 def load_attn_weights(layer_idx=0):
@@ -24,7 +27,8 @@ def load_attn_weights(layer_idx=0):
     model_path = Path(model_path)
     print(f"Loading model from local weights: {model_path}")
 
-    # Load the model
+    # Define and load model. 8B is small enough. Explicit load is safer.
+    # Loudbox cpu load
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         torch_dtype=torch.bfloat16,
@@ -35,7 +39,7 @@ def load_attn_weights(layer_idx=0):
 
     print("Model loaded from local weights.")
 
-    # Extract attention weights
+    # Extract attention weights from specified layer
     attention_weights = {}
     weight_keys = {
         "q_proj": f"model.layers.{layer_idx}.self_attn.q_proj.weight",
@@ -49,7 +53,6 @@ def load_attn_weights(layer_idx=0):
         current = model
         for k in keys:
             current = getattr(current, k)
-
         if hasattr(current, "weight"):
             weight = current.weight.data
             print(f"Loaded {name} weight: {weight.shape}")
@@ -65,19 +68,10 @@ def load_attn_weights(layer_idx=0):
 
 
 def load_reference_inputs():
-    """
-    interest        = "decoder_0.pt"
-    root            = os.getcwd()
-    ref_data_path   = os.path.join(root, "reference_data")
-    ref_data_file   = os.path.join(ref_data_path, interest)
-    ref_data        = torch.load(ref_data_file)
-    example         = ref_data[4]
-    ref_inputs      = example['args/hidden_states']
-    """
     root = os.getcwd()
     ref_data_path = os.path.join(root, "reference_data")
     example = torch.load(os.path.join(ref_data_path, "example_with_intermediates.pt"))
-    ref_inputs = example["args/hidden_states_post_norm"]
+    ref_inputs = example["args/hidden_states"]
     print("Reference data loaded")
     return example, ref_inputs
 
@@ -93,7 +87,20 @@ def pcc(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return corr
 
 
-# For program configs.
+def generate_random_qkv_inputs_torch(N=1, low=-0.5, high=0.5, seq_len=32, dtype=torch.bfloat16):
+    random_tensors = []
+    for _ in range(min(int(N), 1)):
+        random_tensor = low + (high - low) * torch.rand(1, int(seq_len), MODEL_HIDDEN)
+        random_tensor.to(dtype)
+        random_tensors.append(random_tensor)
+    print("Random torch tensors created...")
+    return random_tensors
+
+
+# For program configs. Sharded tensors. TT default. No reason to stick to this?
+tile_padded_batch_rows = TILE_SIZE
+
+
 def find_largest_divisor(n, max_divisor=8):
     for i in range(max_divisor, 0, -1):
         if n % i == 0:
@@ -172,14 +179,15 @@ matmul_prog_config_qo = dram_matmul_config(
     n=int(MODEL_HIDDEN / GQA_GROUP_SIZE),
     num_cores=mlp_core_grid_qo.num_cores,
 )
-# For program configs.
+# For program configs. Sharded tensors. TT default. No reason to stick to this?
 
 # Compute kernel definitions
 compute_kernel_config_hifi4 = ttnn.WormholeComputeKernelConfig(
     math_fidelity=ttnn.MathFidelity.HiFi4,
     math_approx_mode=False,
     fp32_dest_acc_en=True,
-    packer_l1_acc=True,  # False is an order of mangnitude worse. why?
+    packer_l1_acc=True,
+    # False is an order of mangnitude worse. Why?
 )
 # Compute kernel definitions
 
@@ -189,20 +197,25 @@ if __name__ == "__main__":
     attention_weights_torch = load_attn_weights(layer_idx=0)
 
     # QKV load + cast to bfloat16
-    q_proj_layer = nn.Linear(4096, 32 * 128, bias=False)
+    q_proj_layer = nn.Linear(MODEL_HIDDEN, MODEL_HIDDEN, bias=False)
     q_proj_layer.load_state_dict({"weight": attention_weights_torch["q_proj"]})
     q_proj_layer.weight.data = q_proj_layer.weight.data.to(torch.bfloat16)
 
-    k_proj_layer = nn.Linear(4096, 8 * 128, bias=False)
+    k_proj_layer = nn.Linear(MODEL_HIDDEN, int(MODEL_HIDDEN / GQA_GROUP_SIZE), bias=False)
     k_proj_layer.load_state_dict({"weight": attention_weights_torch["k_proj"]})
     k_proj_layer.weight.data = k_proj_layer.weight.data.to(torch.bfloat16)
 
-    v_proj_layer = nn.Linear(4096, 8 * 128, bias=False)
+    v_proj_layer = nn.Linear(MODEL_HIDDEN, int(MODEL_HIDDEN / GQA_GROUP_SIZE), bias=False)
     v_proj_layer.load_state_dict({"weight": attention_weights_torch["v_proj"]})
     v_proj_layer.weight.data = v_proj_layer.weight.data.to(torch.bfloat16)
     # QKV load + cast to bfloat16
 
-    _, reference_inputs = load_reference_inputs()
+    if inputs_from == "random":
+        reference_inputs = generate_random_qkv_inputs_torch()
+        reference_inputs = reference_inputs[0]
+        # sweep later
+    else:
+        _, reference_inputs = load_reference_inputs()
     # Set sequence lengths
     seq_len = min([int(reference_inputs.shape[1]), OBSERVE_SEQ_LEN])
     reference_inputs = reference_inputs[:, 0:seq_len, :]
@@ -236,8 +249,8 @@ if __name__ == "__main__":
     print("Torch outputs (q) : ", torch_output_q.shape, torch_output_q.dtype)
     print("Torch outputs (k) : ", torch_output_k.shape, torch_output_k.dtype)
     print("Torch outputs (v) : ", torch_output_v.shape, torch_output_v.dtype)
-
     print("")
+
     print("Opening device..")
     device = ttnn.open_device(device_id=0)
 
@@ -311,7 +324,7 @@ if __name__ == "__main__":
     print("TT v output computed. Copied to cpu as torch.")
 
     atol = 1e-03
-    rtol = 1e-02
+    rtol = 1e-02  # sweep to get zero error threshold
 
     error_pointwise = torch.abs((torch_output_q - tt_output_q_torch))
     mean_error = torch.mean(error_pointwise)
