@@ -28,6 +28,7 @@ class Attention(LightweightModule):
     ):
         super().__init__()
 
+        self.layer_num = layer_num
         self.state_dict = state_dict
         self.mesh_device = mesh_device
         self.num_devices = configuration.num_devices
@@ -453,11 +454,19 @@ class Attention(LightweightModule):
             memory_config=self.model_config["CREATE_QKV_DECODE_SHARD"],
         )
 
+        print("RoPE qkv heads creation input (xqkv) : ", xqkv_fused.shape)
+        print(
+            "RoPE qkv heads output : (q,k,v)      :",
+            q_heads_pre_rot_1BQD.shape,
+            k_heads_pre_rot_1BKD.shape,
+            v_heads_1BKD.shape,
+        )
+
         q_heads_pre_rot_1BQD = self.q_norm(q_heads_pre_rot_1BQD, mode="decode")
         k_heads_pre_rot_1BKD = self.k_norm(k_heads_pre_rot_1BKD, mode="decode")
 
         ttnn.deallocate(xqkv_fused)
-
+        print("Shape pre Rope (Q,K) : ", q_heads_pre_rot_1BQD.shape, k_heads_pre_rot_1BKD.shape)
         # Q Rotary Embeddings
         q_heads_1BQD = ttnn.experimental.rotary_embedding_llama(
             q_heads_pre_rot_1BQD, rot_mats[0], rot_mats[1], self.transformation_mats["decode"], is_decode_mode=True
@@ -467,6 +476,7 @@ class Attention(LightweightModule):
         k_heads_1BKD = ttnn.experimental.rotary_embedding_llama(
             k_heads_pre_rot_1BKD, rot_mats[0], rot_mats[1], self.transformation_mats["decode"], is_decode_mode=True
         )
+        print("Shape post Rope (Q,K) : ", q_heads_1BQD.shape, k_heads_1BKD.shape)
 
         ttnn.deallocate(q_heads_pre_rot_1BQD)
         ttnn.deallocate(k_heads_pre_rot_1BKD)
@@ -692,6 +702,8 @@ class Attention(LightweightModule):
         if q_heads_1QSD_pre_rot.dtype != ttnn.bfloat16:  # Rotary embeddings require bfloat16 inputs
             q_heads_1QSD_pre_rot = ttnn.typecast(q_heads_1QSD_pre_rot, dtype=ttnn.bfloat16)
 
+        print("Prefill")
+        print("Shape pre Rope (Q,K) : ", q_heads_1QSD_pre_rot.shape, k_heads_1KSD_pre_rot.shape)
         q_heads_1QSD = ttnn.experimental.rotary_embedding_llama(
             q_heads_1QSD_pre_rot,
             rot_mats[0],
@@ -712,6 +724,7 @@ class Attention(LightweightModule):
             is_decode_mode=False,
         )
         ttnn.deallocate(k_heads_1KSD_pre_rot)
+        print("Shape post Rope (Q,K) : ", q_heads_1QSD.shape, k_heads_1KSD.shape)
 
         # Fill KV-Cache
         if kv_cache:

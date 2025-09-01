@@ -8,7 +8,7 @@ import ttnn
 from models.common.lightweightmodule import LightweightModule
 from models.tt_transformers.tt.common import gather_cos_sin, get_rot_transformation_mat, precompute_freqs
 from models.utility_functions import nearest_32
-from ttnn import ReplicateTensorToMesh, ShardTensor2dMesh
+from ttnn import ReplicateTensorToMesh
 
 
 def compute_gather_cos_sin(dhead, end, theta, scale_factor, orig_context_len, position_ids):
@@ -56,14 +56,14 @@ class RotarySetup(LightweightModule):
             device=device,
             layout=ttnn.TILE_LAYOUT,
             dtype=datatype,
-            mesh_mapper=ReplicateTensorToMesh(device) if self.is_mesh_device else None,
+            mesh_mapper=None,
         )
         self.sin_matrix = ttnn.from_torch(
             sin_matrix,
             device=device,
             layout=ttnn.TILE_LAYOUT,
             dtype=datatype,
-            mesh_mapper=ReplicateTensorToMesh(device) if self.is_mesh_device else None,
+            mesh_mapper=None,
         )
 
         self.batch_grid = (
@@ -92,15 +92,7 @@ class RotarySetup(LightweightModule):
             layout=ttnn.TILE_LAYOUT,
             dtype=datatype,
             memory_config=trans_mat_mem_config,
-            mesh_mapper=(
-                ShardTensor2dMesh(
-                    device,
-                    dims=(None, 2) if (self.num_devices == 32 and batch_size > 1) else (None, None),
-                    mesh_shape=list(device.shape),
-                )
-                if self.is_mesh_device
-                else None
-            ),
+            mesh_mapper=None,
         )
 
         # TODO: Colman, should this be TILE_SIZE or head_dim? Why should it be different for prefill and decode?
@@ -111,7 +103,7 @@ class RotarySetup(LightweightModule):
             layout=ttnn.TILE_LAYOUT,
             dtype=datatype,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=ReplicateTensorToMesh(device) if self.is_mesh_device else None,
+            mesh_mapper=None,
         )
 
     def get_both_trans_mats(self):

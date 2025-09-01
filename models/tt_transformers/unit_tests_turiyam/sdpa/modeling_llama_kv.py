@@ -254,7 +254,8 @@ class LlamaRotaryEmbedding_L31(nn.Module):
     def forward(self, x, position_ids):
         if "dynamic" in self.rope_type:
             self._dynamic_frequency_update(position_ids, device=x.device)
-
+        # x = x.to(torch.bfloat16)
+        # x = x.to(torch.float32)
         # Core RoPE block
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
         position_ids_expanded = position_ids[:, None, :].float()
@@ -612,6 +613,8 @@ class LlamaAttention(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.pretraining_tp = config.pretraining_tp
         self.max_position_embeddings = config.max_position_embeddings
+        print("")
+        print("In attn init ")
         print("Head dim     : ", self.head_dim)
         print("num heads    : ", self.num_heads)
         print("Hidden size  : ", self.hidden_size)
@@ -637,8 +640,13 @@ class LlamaAttention(nn.Module):
         self.k_proj.load_state_dict({"weight": k0_ckpt})
         self.v_proj.load_state_dict({"weight": v0_ckpt})
         self.o_proj.load_state_dict({"weight": o0_ckpt})
+        self.q_proj.weight.data = self.q_proj.weight.data.to(torch.bfloat16)
+        self.k_proj.weight.data = self.k_proj.weight.data.to(torch.bfloat16)
+        self.v_proj.weight.data = self.v_proj.weight.data.to(torch.bfloat16)
+        self.o_proj.weight.data = self.o_proj.weight.data.to(torch.bfloat16)
 
     def _init_rope(self):
+        print("Rope Init")
         print("RoPE scaling : ", self.config.rope_scaling)
         if self.config.rope_scaling is None:
             self.rotary_emb = LlamaRotaryEmbedding(
@@ -648,7 +656,6 @@ class LlamaAttention(nn.Module):
         else:
             try:
                 scaling_type = self.config.rope_scaling["type"]
-                print("Identified scaling type : ", scaling_type)
                 scaling_factor = self.config.rope_scaling["factor"]
                 if scaling_type == "linear":
                     print("Llama rope scaling is none : LlamaLinearScaling")
@@ -669,8 +676,7 @@ class LlamaAttention(nn.Module):
                 else:
                     raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
             except:
-                # print("For LLaMA 31")
-                print("LlamaRotaryEmbedding_L31")
+                print("RoPE class chosen : LlamaRotaryEmbedding_L31")
                 self.rotary_emb = LlamaRotaryEmbedding_L31(config=self.config)
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
@@ -687,6 +693,7 @@ class LlamaAttention(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
+        # hidden_states = hidden_states.to(torch.bfloat16)
         intermediates = {}
         if self.pretraining_tp > 1:
             key_value_slicing = (self.num_key_value_heads * self.head_dim) // self.pretraining_tp
@@ -711,7 +718,9 @@ class LlamaAttention(nn.Module):
         intermediates["q_proj"] = query_states
         intermediates["k_proj"] = key_states
         intermediates["v_proj"] = value_states
+
         print("qkv shapes (post qkv) : ", query_states.shape, key_states.shape, value_states.shape)
+        print("qkv dtypes (post qkv) : ", query_states.dtype, key_states.dtype, value_states.dtype)
 
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -720,6 +729,9 @@ class LlamaAttention(nn.Module):
 
         intermediates["q_pre_rope"] = query_states
         intermediates["k_pre_rope"] = key_states
+
+        query_states = query_states.to(torch.bfloat16)
+        key_states = key_states.to(torch.bfloat16)
 
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
@@ -730,7 +742,12 @@ class LlamaAttention(nn.Module):
         else:
             cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+
         print("qkv shapes (post-rope): ", query_states.shape, key_states.shape, value_states.shape)
+        print("qkv dtypes (post-rope): ", query_states.dtype, key_states.dtype, value_states.dtype)
+
+        # query_states = query_states.to(torch.float32)
+        # key_states   = key_states.to(torch.float32)
 
         intermediates["q_post_rope"] = query_states
         intermediates["k_post_rope"] = key_states
@@ -779,6 +796,7 @@ class LlamaAttention(nn.Module):
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+        print("qkv dtypes (post-rope): ", attn_output.dtype)
 
         if self.pretraining_tp > 1:
             attn_output = attn_output.split(self.hidden_size // self.pretraining_tp, dim=2)
@@ -1502,7 +1520,6 @@ if __name__ == "__main__":
     # Check if the directory exists
     if not model_path.exists():
         print(f"Model directory does not exist: {model_path}")
-
     # Check for config.json
     config_file = model_path / "config.json"
     if not config_file.exists():
@@ -1513,6 +1530,8 @@ if __name__ == "__main__":
     # Create Llama Attn class and load qkvo
     with open(config_file, "r") as f:
         config = json.load(f)
+    print("Llama model congig : ")
+    print(config)
     A = LlamaAttention(LlamaConfig(**config))
     A._load_qkvo(model_path)
     # Create Llama Attn class and load qkvo
@@ -1533,8 +1552,14 @@ if __name__ == "__main__":
 
     # Add normalized inputs and attention outputs to the reference data
     hidden_states = example["args/hidden_states"]
+    print("Hidden states type before RMS Norm : ", hidden_states.dtype)
+    hidden_states = hidden_states.to(torch.float32)
+    print("Pre norm range : ", torch.min(hidden_states), torch.max(hidden_states))
     hidden_states = rms_norm(hidden_states, rms_norm_ckpt)
-    hidden_states = hidden_states.to(torch.float)
+    print("Hidden states type after RMS Norm  : ", hidden_states.dtype)
+    hidden_states = hidden_states.to(torch.bfloat16)
+    print("Post norm range : ", torch.min(hidden_states), torch.max(hidden_states))
+
     example["args/hidden_states_post_norm"] = hidden_states
 
     attention_mask = example["args/attention_mask"]

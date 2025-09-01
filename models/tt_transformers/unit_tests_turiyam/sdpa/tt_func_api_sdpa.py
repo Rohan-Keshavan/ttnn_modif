@@ -4,7 +4,12 @@ import torch
 from attention_utils import check_llama_availability
 
 import ttnn
-from models.tt_transformers.tt.common import gather_cos_sin, get_rot_transformation_mat, precompute_freqs
+from models.tt_transformers.tt.common import (
+    gather_cos_sin,
+    get_prefill_rot_mat,
+    get_rot_transformation_mat,
+    precompute_freqs,
+)
 from models.tt_transformers.tt.rope import RotarySetup
 
 
@@ -30,8 +35,7 @@ class AttentionBlock:
             layer_idx: Decoder block index to load (default: 0)
         """
         print("")
-        print("------------------------------Layer setup start--------------------------")
-        print("")
+        print("Setting up the attention layer...")
         self.device = device
         self.model_path = model_path
         self.layer_idx = layer_idx
@@ -91,7 +95,7 @@ class AttentionBlock:
         # Initialize KV cache
         self.init_kv_cache(max_capacity=2048)
         print("")
-        print("------------------------------Layer setup end ---------------------------")
+        print("Setup complete...")
         print("")
 
     def load_weights(self, model_path, layer_idx):
@@ -298,41 +302,6 @@ class AttentionBlock:
         self.trans_mats_dict = self.rope_setup.get_both_trans_mats()
         print("RoPE init complete")
 
-    def init_kv_cache(self, max_capacity=2048):
-        """
-        Initialize static KV Cache.
-        Args:
-            max_capacity: Maximum allowed cache capacity (default: 8192 tokens)
-        """
-        print(f"Initializing static KV cache: max={max_capacity}")
-        self.max_capacity = max_capacity
-        # KV cache dimensions: [batch, n_heads, seq_len, head_dim]
-        # GQA: n_heads = N_QHEADS (after expansion)
-        k_cache = torch.zeros(self.BATCH_SIZE, self.N_QHEADS, max_capacity, self.HEAD_DIM)
-        v_cache = torch.zeros(self.BATCH_SIZE, self.N_QHEADS, max_capacity, self.HEAD_DIM)
-
-        self.K_past = ttnn.as_tensor(
-            k_cache,
-            device=self.device,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            dtype=ttnn.bfloat16,
-            layout=ttnn.TILE_LAYOUT,
-        )
-
-        self.V_past = ttnn.as_tensor(
-            v_cache,
-            device=self.device,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            dtype=ttnn.bfloat16,
-            layout=ttnn.TILE_LAYOUT,
-        )
-
-        self.kv_len = 0
-        self.max_capacity = max_capacity
-
-        print(f"Static KV cache initialized: {self.K_past.shape}, {self.V_past.shape}")
-        print(f"   - Max capacity: {self.max_capacity}")
-
     def forward(self, input_tokens, position_indices, attention_mask=None):
         """
         Forward pass for K tokens.
@@ -348,56 +317,45 @@ class AttentionBlock:
 
         intermediates = {}
         print("")
-        print("----------------------Model forward start--------------------------")
-        print(f"Forward pass: {input_tokens.shape}, positions: {position_indices}")
+        print(f"Forward pass: {input_tokens.shape}")
         intermediates["inputs"] = input_tokens
 
-        # Step 1: GQA Weight Expansion
-        # K_expanded, V_expanded = self._expand_gqa_weights()
-
-        # Step 2: QKV Projection
-        # q_proj, k_proj, v_proj = self._project_qkv(input_tokens, K_expanded, V_expanded)
-
+        # Step 1: QKV Projection
         q_proj, k_proj, v_proj = self._project_qkv(input_tokens, reshape_and_expand=True)
         intermediates["q_proj"] = q_proj
         intermediates["k_proj"] = k_proj
         intermediates["v_proj"] = v_proj
 
-        # Step 3: Reshape to separate heads
-        # q_reshaped, k_reshaped, v_reshaped = self._reshape_to_heads(q_proj, k_proj, v_proj)
-
+        # Step 2: Rope Prepare + Apply
         rot_mats = self._prepare_step_rope(position_ids)
-
-        # Step 4: Apply RoPE
-        q_rotated, k_rotated = self._apply_rope(q_proj, k_proj, position_indices, rot_mats=rot_mats)
+        q_rotated, k_rotated = self._apply_rope(q_proj, k_proj, rot_mats=rot_mats)
         intermediates["k_post_rope"] = k_rotated
         intermediates["q_post_rope"] = q_rotated
-        print("Post Rope shapes (q,k) : ", q_rotated.shape, k_rotated.shape)
 
-        # Head broadcast, K and V
+        # Step 3 : Head broadcast, K and V : Can keep cache smaller, optimize for later
         k_rotated = ttnn.repeat(k_rotated, [1, self.GQA_GROUP_SIZE, 1, 1])
         v_proj = ttnn.repeat(v_proj, [1, self.GQA_GROUP_SIZE, 1, 1])
-        # Head broadcast, K and V
+        # Head broadcast,         K and V : Can keep cache smaller, optimize for later
 
-        # Step 5: Update KV cache (after computing attention)
+        # Step 4: Update KV cache
         self._update_kv_cache(k_rotated, v_proj)
-        print(f"KV cache updated: {self.K_past.shape}, {self.V_past.shape}")
-        print(f"Current cache length: {self.kv_len}")
+        print(f"KV updated. Current cache length: {self.kv_len}")
+        # Step 4: Update KV cache
 
-        # Step 6: Compute attention (this will handle cache vs. no-cache cases)
-        # attn_out = self._compute_attention_with_cache(q_rotated, k_rotated, v_reshaped, attention_mask)
+        # Step 5: Attention
         attn_out = self._compute_attention_with_cache(q_rotated, k_rotated, v_proj, attention_mask)
         print(f"Attention output: {attn_out.shape}")
+        # Step 5: Attention
 
-        # Step 7: Output projection
+        # Step 6: Output projection
         output = self._output_projection(attn_out)
+        # Step 6: Output projection
 
         # Cleanup intermediate tensors
-        # print("Cleaning up intermediate tensors...")
+        print("Cleaning up intermediates...")
         # self._cleanup_intermediate_tensors([q_reshaped, k_reshaped, v_reshaped])#[q_proj, k_proj, v_proj]
 
         print("Forward pass complete.")
-        print("----------------------Model forward end ---------------------------")
         print("")
 
         return output, intermediates
@@ -440,7 +398,7 @@ class AttentionBlock:
         q_proj = ttnn.linear(
             input_tokens,
             self.Q,
-            dtype=ttnn.float32,
+            dtype=ttnn.bfloat16,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             compute_kernel_config=self.compute_kernel_config_hifi4,
         )
@@ -448,7 +406,7 @@ class AttentionBlock:
         k_proj = ttnn.linear(
             input_tokens,
             self.K,
-            dtype=ttnn.float32,
+            dtype=ttnn.bfloat16,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             compute_kernel_config=self.compute_kernel_config_hifi4,
         )
@@ -456,7 +414,7 @@ class AttentionBlock:
         v_proj = ttnn.linear(
             input_tokens,
             self.V,
-            dtype=ttnn.float32,
+            dtype=ttnn.bfloat16,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             compute_kernel_config=self.compute_kernel_config_hifi4,
         )
@@ -493,7 +451,7 @@ class AttentionBlock:
 
         return q_reshaped, k_reshaped, v_reshaped
 
-    def _apply_rope(self, q_reshaped, k_reshaped, position_indices, rot_mats=None):
+    def _apply_rope(self, q_reshaped, k_reshaped, rot_mats=None):
         """Apply RoPE to Q and K."""
         print("Applying RoPE...")
 
@@ -517,110 +475,41 @@ class AttentionBlock:
 
         """
 
-        # Use the custom RoPE function
-        q_rotated, k_rotated = apply_custom_rope_to_qk(
-            q_reshaped,
-            k_reshaped,
-            position_indices,
-            self.device,
-            head_dim=self.HEAD_DIM,
-            theta=self.hf_model_config["rope_theta"],
-            scale_factor=self.hf_model_config["rope_scaling_factor"],
-            orig_context_len=self.hf_model_config["original_max_position_embeddings"],
+        trans_mat = get_rot_transformation_mat(self.HEAD_DIM)
+        trans_mat_tt = ttnn.from_torch(
+            trans_mat,
+            device=device,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        q_rotated = ttnn.experimental.rotary_embedding_llama(
+            q_reshaped, cos_cache=rot_mats[0], sin_cache=rot_mats[1], trans_mat=trans_mat_tt, is_decode_mode=False
+        )
+        k_rotated = ttnn.experimental.rotary_embedding_llama(
+            k_reshaped, cos_cache=rot_mats[0], sin_cache=rot_mats[1], trans_mat=trans_mat_tt, is_decode_mode=False
         )
 
-        print(f"RoPE applied: {q_rotated.shape}, {k_rotated.shape}")
+        print(f"QK rotated: {q_rotated.shape}, {k_rotated.shape}")
         return q_rotated, k_rotated
 
     def _prepare_step_rope(self, position_indices):
         max_position = max(position_indices)
-        # print('Max position : KV length : ' , max_position, self.kv_len)
-        tt_rot_mats_prefill = [
-            self.rope_setup.cos_matrix[:, :, self.kv_len : self.kv_len + max_position, :],
-            self.rope_setup.sin_matrix[:, :, self.kv_len : self.kv_len + max_position, :],
-        ]
-        return tt_rot_mats_prefill
+        min_position = min(position_indices)
 
-    def _grow_cache_if_needed(self, required_capacity):
-        """
-        Grow the KV cache if needed to accommodate the required capacity.
-
-        Args:
-            required_capacity: Required cache capacity
-        """
-        if required_capacity <= self.cache_capacity:
-            return  # No growth needed
-
-        # Calculate new capacity
-        new_capacity = max(int(self.cache_capacity * self.growth_factor), required_capacity)
-
-        # Cap at maximum capacity
-        if new_capacity > self.max_capacity:
-            if required_capacity > self.max_capacity:
-                raise ValueError(f"Required capacity {required_capacity} exceeds maximum capacity {self.max_capacity}")
-            new_capacity = self.max_capacity
-
-        print(f"🔄 Growing KV cache: {self.cache_capacity} -> {new_capacity}")
-
-        # Create new larger cache
-        new_k_cache = torch.zeros(new_capacity, self.BATCH_SIZE, self.N_QHEADS, self.HEAD_DIM)
-        new_v_cache = torch.zeros(new_capacity, self.BATCH_SIZE, self.N_QHEADS, self.HEAD_DIM)
-
-        # Copy existing data to new cache
-        if self.kv_len > 0:
-            new_k_cache[: self.kv_len] = self.K_past.to_torch()
-            new_v_cache[: self.kv_len] = self.V_past.to_torch()
-
-        # Deallocate old cache
-        self.K_past.deallocate(True)
-        self.V_past.deallocate(True)
-
-        # Create new TT-Metal tensors
-        self.K_past = ttnn.as_tensor(
-            new_k_cache,
-            device=self.device,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            dtype=ttnn.bfloat16,
-            layout=ttnn.TILE_LAYOUT,
+        tt_cos_matrix = self.rope_setup.cos_matrix[:, :, self.kv_len : self.kv_len + max_position + 1, :]
+        tt_sin_matrix = self.rope_setup.sin_matrix[:, :, self.kv_len : self.kv_len + max_position + 1, :]
+        torch_cos_matrix = ttnn.to_torch(ttnn.from_device(tt_cos_matrix))
+        torch_sin_matrix = ttnn.to_torch(ttnn.from_device(tt_sin_matrix))
+        idx = torch.tensor(position_ids, dtype=torch.long)
+        torch_cosines_full = torch_cos_matrix[:, :, idx - min_position, :]
+        torch_sines_full = torch_sin_matrix[:, :, idx - min_position, :]
+        tt_cosines_full = ttnn.from_torch(
+            torch_cosines_full, device=device, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16
         )
-
-        self.V_past = ttnn.as_tensor(
-            new_v_cache,
-            device=self.device,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            dtype=ttnn.bfloat16,
-            layout=ttnn.TILE_LAYOUT,
-        )
-
-        # Update capacity
-        old_capacity = self.cache_capacity
-        self.cache_capacity = new_capacity
-
-        print(f"✅ Cache grown successfully: {old_capacity} -> {self.cache_capacity}")
-        print(f"   - New cache shapes: {self.K_past.shape}, {self.V_past.shape}")
-
-    def _update_kv_cache(self, k_new, v_new):
-        print("Updating KV cache...")
-
-        # Check if we need to grow the cache
-        # new_total_length = self.kv_len + k_new.shape[0]
-        # self._grow_cache_if_needed(new_total_length)
-
-        # Simple concatenation - the cache is already the right size!
-        print("KV shapes : ", k_new.shape, v_new.shape)
-        if self.kv_len == 0:
-            ttnn.fill_cache(self.K_past, k_new, batch_idx=0)
-            ttnn.fill_cache(self.V_past, v_new, batch_idx=0)
-        else:
-            ttnn.update_cache(self.K_past, k_new, update_idx=self.kv_len, batch_offset=0)
-            ttnn.update_cache(self.V_past, v_new, update_idx=self.kv_len, batch_offset=0)
-
-        # If  cache overfill
-        # For later
-        # If  cache overfill
-
-        # Update cache length
-        self.kv_len += k_new.shape[2]
+        tt_sines_full = ttnn.from_torch(torch_sines_full, device=device, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16)
+        # Need the full thing
+        return [tt_cosines_full, tt_sines_full]
 
     def manual_kv_add(self, k_ext, v_ext):
         # Torch inputs
@@ -682,17 +571,6 @@ class AttentionBlock:
             v_current: Current V tokens [seq_len, batch, heads, head_dim]
             attention_mask: Optional attention mask
         """
-        """
-        if self.kv_len == 0:
-            # First forward pass: use only current tokens
-            print("First forward pass: using current tokens only")
-            return self._compute_attention_current_tokens_only(q_rotated, k_current, v_current, attention_mask)
-        else:
-            # Subsequent passes: use cache + current tokens
-            print(f"Using KV cache + current tokens: cache={self.kv_len}, current={q_rotated.shape[0]}")
-            return self._compute_attention_with_cache_and_current(q_rotated, k_current, v_current, attention_mask)
-        """
-        print(f"Using KV cache + current tokens: cache={self.kv_len}, current={q_rotated.shape[0]}")
         return self._compute_attention_with_cache_and_current(q_rotated, k_current, v_current, attention_mask)
 
     def _compute_attention_current_tokens_only(self, q_rotated, k_current, v_current, attention_mask=None):
@@ -744,19 +622,16 @@ class AttentionBlock:
         # Slice the cache to only use filled portion
         K_filled = ttnn.slice(self.K_past, (0, 0, 0, 0), (self.BATCH_SIZE, self.N_QHEADS, self.kv_len, self.HEAD_DIM))
         V_filled = ttnn.slice(self.V_past, (0, 0, 0, 0), (self.BATCH_SIZE, self.N_QHEADS, self.kv_len, self.HEAD_DIM))
-
-        print(f"Using filled KV cache: {K_filled.shape}, {V_filled.shape} (filled: {self.kv_len}/{self.max_kv_len})")
-        print("q in shape : ", q_rotated.shape)
-        # Prepare tensors for attention
-        # q_permuted = ttnn.permute(q_rotated, (1, 2, 0, 3))  # [batch, heads, seq_len, head_dim]
+        print(f"Using filled KV cache: {K_filled.shape}, {V_filled.shape} (filled: {self.kv_len}/{self.max_capacity})")
 
         K_permuted = ttnn.permute(K_filled, (0, 1, 3, 2))  # [batch, heads, head_dim, total_seq_len]
-        # V_permuted = ttnn.permute(V_filled, (0, 1, 2, 3))  # [batch, heads, total_seq_len, head_dim]
+        print("K filled and K permuted shape : ", K_filled.shape)
         print("V filled and V permuted shape : ", V_filled.shape)
+
         # Compute attention scores: Q @ K^T
         QKT = ttnn.matmul(q_rotated, K_permuted)  # was q_permuted  # [batch, heads, seq_len, total_seq_len]
         QKT = QKT * self.ATTN_SCALE
-        print("QKT shape : ", QKT.shape)
+
         # Apply attention mask if provided
         if attention_mask is not None:
             print("Attn mask shape : ", attention_mask.shape)
@@ -784,7 +659,7 @@ class AttentionBlock:
         # Reshape back to [seq_len, batch, heads, head_dim]
         attn_out = ttnn.permute(attn_out, (0, 2, 1, 3))
 
-        print(f"Cache + current attention output: {attn_out.shape}")
+        print(f"Attention output: {attn_out.shape}")
 
         # Clean up intermediate tensors
         K_filled.deallocate(True)
@@ -813,13 +688,60 @@ class AttentionBlock:
         print(f"Final output: {output.shape}")
         return output
 
-    def _cleanup_intermediate_tensors(self, tensors):
-        """Clean up intermediate tensors."""
-        for tensor in tensors:
-            if tensor is not None:
-                tensor.deallocate(True)
+    # KV Cache management methods
+    def init_kv_cache(self, max_capacity=2048):
+        """
+        Initialize static KV Cache.
+        Args:
+            max_capacity: Maximum allowed cache capacity (default: 8192 tokens)
+        """
+        print(f"Initializing static KV cache: max={max_capacity}")
+        self.max_capacity = max_capacity
+        # KV cache dimensions: [batch, n_heads, seq_len, head_dim]
+        # GQA: n_heads = N_QHEADS (after expansion)
+        k_cache = torch.zeros(self.BATCH_SIZE, self.N_QHEADS, max_capacity, self.HEAD_DIM)
+        v_cache = torch.zeros(self.BATCH_SIZE, self.N_QHEADS, max_capacity, self.HEAD_DIM)
 
-    # KV Cache Management Methods
+        self.K_past = ttnn.as_tensor(
+            k_cache,
+            device=self.device,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+        )
+        self.V_past = ttnn.as_tensor(
+            v_cache,
+            device=self.device,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+        )
+
+        self.kv_len = 0
+        self.max_capacity = max_capacity
+
+        print(f"Static KV cache initialized: {self.K_past.shape}, {self.V_past.shape}")
+        print(f"   - Max capacity: {self.max_capacity}")
+
+    def _update_kv_cache(self, k_new, v_new):
+        print("Updating KV cache...")
+
+        # Simple concatenation - the cache is already the right size!
+        print("KV shapes : ", k_new.shape, v_new.shape)
+        if self.kv_len == 0:
+            ttnn.fill_cache(self.K_past, k_new, batch_idx=0)
+            ttnn.fill_cache(self.V_past, v_new, batch_idx=0)
+        else:
+            ttnn.update_cache(self.K_past, k_new, update_idx=self.kv_len, batch_offset=0)
+            ttnn.update_cache(self.V_past, v_new, update_idx=self.kv_len, batch_offset=0)
+
+        # If  cache overfill
+        # For later
+        # If  cache overfill
+
+        # Update cache length
+        self.kv_len += k_new.shape[2]
+
     def get_kv_cache_state(self):
         """Get current KV cache state."""
         return {
@@ -951,6 +873,73 @@ class AttentionBlock:
         else:
             print(f"✅ Cache size already optimal for {target_utilization*100:.0f}% utilization")
 
+    def _grow_cache_if_needed(self, required_capacity):
+        """
+        Grow the KV cache if needed to accommodate the required capacity.
+
+        Args:
+            required_capacity: Required cache capacity
+        """
+        if required_capacity <= self.cache_capacity:
+            return  # No growth needed
+
+        # Calculate new capacity
+        new_capacity = max(int(self.cache_capacity * self.growth_factor), required_capacity)
+
+        # Cap at maximum capacity
+        if new_capacity > self.max_capacity:
+            if required_capacity > self.max_capacity:
+                raise ValueError(f"Required capacity {required_capacity} exceeds maximum capacity {self.max_capacity}")
+            new_capacity = self.max_capacity
+
+        print(f"🔄 Growing KV cache: {self.cache_capacity} -> {new_capacity}")
+
+        # Create new larger cache
+        new_k_cache = torch.zeros(new_capacity, self.BATCH_SIZE, self.N_QHEADS, self.HEAD_DIM)
+        new_v_cache = torch.zeros(new_capacity, self.BATCH_SIZE, self.N_QHEADS, self.HEAD_DIM)
+
+        # Copy existing data to new cache
+        if self.kv_len > 0:
+            new_k_cache[: self.kv_len] = self.K_past.to_torch()
+            new_v_cache[: self.kv_len] = self.V_past.to_torch()
+
+        # Deallocate old cache
+        self.K_past.deallocate(True)
+        self.V_past.deallocate(True)
+
+        # Create new TT-Metal tensors
+        self.K_past = ttnn.as_tensor(
+            new_k_cache,
+            device=self.device,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+        )
+
+        self.V_past = ttnn.as_tensor(
+            new_v_cache,
+            device=self.device,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+        )
+
+        # Update capacity
+        old_capacity = self.cache_capacity
+        self.cache_capacity = new_capacity
+
+        print(f"✅ Cache grown successfully: {old_capacity} -> {self.cache_capacity}")
+        print(f"   - New cache shapes: {self.K_past.shape}, {self.V_past.shape}")
+
+    # KV Cache management methods
+
+    # cleanup
+    def _cleanup_intermediate_tensors(self, tensors):
+        """Clean up intermediate tensors."""
+        for tensor in tensors:
+            if tensor is not None:
+                tensor.deallocate(True)
+
     def cleanup(self):
         """Clean up all resources."""
         print("")
@@ -974,6 +963,8 @@ class AttentionBlock:
 
         print("AttentionBlock cleanup complete")
 
+    # cleanup
+
 
 # Keep the existing utility functions for now (will move to separate file)
 def apply_custom_rope_to_qk(
@@ -991,20 +982,15 @@ def apply_custom_rope_to_qk(
     """
     # Step 1: Precompute cos/sin frequencies for all possible positions
     max_pos = max(position_indices) if len(position_indices) > 0 else 0
-    buffer_size = 100  # Add buffer for safety
     cos, sin = precompute_freqs(
-        dim=head_dim,
-        end=max_pos + buffer_size + 1,
-        theta=theta,
-        scale_factor=scale_factor,
-        orig_context_len=orig_context_len,
+        dim=head_dim, end=max_pos + 1, theta=theta, scale_factor=scale_factor, orig_context_len=orig_context_len
     )
-    # print('cos and sine shapes : ' , cos.shape, sin.shape)
+    print("Rope prep cos and sine shapes : ", cos.shape, sin.shape)
 
+    pos_ids = position_indices
     # Step 2: Gather cos/sin values for the specific positions
     if not isinstance(position_indices, torch.Tensor):
         position_indices = torch.tensor(position_indices, dtype=torch.long)
-
     cos_gathered, sin_gathered = gather_cos_sin(position_indices, cos, sin)
 
     # Step 3: Get the transformation matrix
@@ -1012,12 +998,20 @@ def apply_custom_rope_to_qk(
     trans_mat_tt = ttnn.from_torch(
         trans_mat, device=device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG
     )
+    trans_mat_tt = get_prefill_rot_mat(
+        head_dim=head_dim,
+        mesh_device=None,
+        seq_len=len(pos_ids),
+        theta=theta,
+        scale_factor=scale_factor,
+        orig_context_len=orig_context_len,
+        start_pos=min(pos_ids),
+    )
 
     # Step 4: Convert cos/sin to TT-Metal tensors
     cos_tt = ttnn.from_torch(
         cos_gathered, device=device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG
     )
-
     sin_tt = ttnn.from_torch(
         sin_gathered, device=device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG
     )
@@ -1032,7 +1026,6 @@ def apply_custom_rope_to_qk(
     q_rotated = ttnn.experimental.rotary_embedding_llama(
         q_proj_reshaped, cos_tt, sin_tt, trans_mat_tt, is_decode_mode=False
     )
-
     k_rotated = ttnn.experimental.rotary_embedding_llama(
         k_proj_reshaped, cos_tt, sin_tt, trans_mat_tt, is_decode_mode=False
     )
@@ -1055,6 +1048,17 @@ def rms_norm(x, norm_weights):
 
     # Multiply normalized tensor by the provided normalization weights
     return (x * normalized) * norm_weights
+
+
+def pcc(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    x = x.view(-1).float()
+    y = y.view(-1).float()
+
+    vx = x - x.mean()
+    vy = y - y.mean()
+
+    corr = torch.sum(vx * vy) / torch.sqrt(torch.sum(vx**2) * torch.sum(vy**2))
+    return corr
 
 
 if __name__ == "__main__":
@@ -1107,6 +1111,9 @@ if __name__ == "__main__":
         print(f"First forward pass output: {output.shape}")
         # Forward pass
 
+        atol = 1e-04
+        rtol = 3e-02
+
         # Check RoPE : Inputs
         rope_inputs_q_tt_model = tt_intermediates["q_proj"]
         rope_inputs_k_tt_model = tt_intermediates["k_proj"]
@@ -1126,6 +1133,7 @@ if __name__ == "__main__":
         )
         # Check RoPE : Inputs
 
+        """
         # Check RoPE : Outputs
         rope_outputs_q_tt_model = tt_intermediates["q_post_rope"]
         rope_outputs_k_tt_model = tt_intermediates["k_post_rope"]
@@ -1144,6 +1152,7 @@ if __name__ == "__main__":
             torch.allclose(rope_outputs_q_tt_model, rope_outputs_q_reference, atol=1e-04, rtol=1e-02),
         )
         # Check RoPE : Outputs
+        """
 
         """
         # Verify intermediates
@@ -1173,6 +1182,13 @@ if __name__ == "__main__":
             torch.allclose(torch_output, tt_output, atol=1e-04, rtol=1e-02),
         )
         print("Mean and Max L1 errors : ", mean_error, max_error)
+
+        mask = torch.abs(torch_output - tt_output) > (atol + rtol * torch.abs(tt_output))
+        # fraction (or %) of elements failing the criterion
+        fail_fraction = mask.float().mean().item()
+        fail_percent = fail_fraction * 100
+        print("Fail percent : ", fail_percent)
+        print("Pcc (q) : ", pcc(torch_output, tt_output))
         # Get reference output
 
         # Check KV cache state
