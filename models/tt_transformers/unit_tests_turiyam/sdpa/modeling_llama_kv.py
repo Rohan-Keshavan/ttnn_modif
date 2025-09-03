@@ -721,7 +721,7 @@ class LlamaAttention(nn.Module):
 
         intermediates["q_pre_rope"] = query_states
         intermediates["k_pre_rope"] = key_states
-
+        intermediates["v_pre_rope"] = value_states
         query_states = query_states.to(torch.bfloat16)
         key_states = key_states.to(torch.bfloat16)
 

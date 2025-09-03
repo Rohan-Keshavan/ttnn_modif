@@ -497,6 +497,8 @@ class AttentionBlock:
         # Step 2: Rope Prepare + Apply
         if self.rope_cpu:
             q_rotated, k_rotated = self._apply_rope_cpu(q_proj, k_proj, position_indices)
+            intermediates["k_post_rope"] = k_rotated
+            intermediates["q_post_rope"] = q_rotated
         else:
             rot_mats = self._prepare_step_rope(position_ids)
             q_rotated, k_rotated = self._apply_rope(q_proj, k_proj, rot_mats=rot_mats)
@@ -504,13 +506,16 @@ class AttentionBlock:
             intermediates["q_post_rope"] = q_rotated
 
         # Step 3 : Head broadcast, K and V : Can keep cache smaller, optimize for later
-        k_rotated = ttnn.repeat(k_rotated, [1, self.GQA_GROUP_SIZE, 1, 1])
-        v_proj = ttnn.repeat(v_proj, [1, self.GQA_GROUP_SIZE, 1, 1])
+        # k_rotated                           = ttnn.repeat(k_rotated , [1, self.GQA_GROUP_SIZE, 1, 1])
+        # v_proj                              = ttnn.repeat(v_proj    , [1, self.GQA_GROUP_SIZE, 1, 1])
         # Head broadcast,         K and V : Can keep cache smaller, optimize for later
 
         # Step 4: Update KV cache
         self._update_kv_cache(k_rotated, v_proj)
         print(f"KV updated. Current cache length: {self.kv_len}")
+        intermediates["K_cache_pre_attention"] = self.K_past
+        intermediates["V_cache_pre_attention"] = self.V_past
+        intermediates["kv_len_pre_attention"] = self.kv_len
         # Step 4: Update KV cache
 
         # Step 5: Attention
@@ -670,7 +675,7 @@ class AttentionBlock:
     def _apply_rope_cpu(self, q, k, pos_ids):
         q = ttnn.to_torch(ttnn.from_device(q)).to(torch.bfloat16)
         k = ttnn.to_torch(ttnn.from_device(k)).to(torch.bfloat16)
-        cos, sin = self.rotary_emb(q, pos_ids.to(torch.long))
+        cos, sin = self.rotary_emb(q, torch.tensor(pos_ids).unsqueeze(0).to(torch.long))
         q_rotated, k_rotated = apply_rotary_pos_emb_L31(q, k, cos, sin)
         q_rotated = ttnn.from_torch(
             q_rotated,
@@ -706,44 +711,40 @@ class AttentionBlock:
         # Need the full thing
         return [tt_cosines_full, tt_sines_full]
 
-    def manual_kv_add(self, k_ext, v_ext):
-        # Torch inputs
-
-        k_ext = k_ext.repeat(1, self.GQA_GROUP_SIZE, 1, 1)
-        v_ext = v_ext.repeat(1, self.GQA_GROUP_SIZE, 1, 1)
+    def manual_kv_add(self, k_ext, v_ext):  # Torch inputs
+        # k_ext = k_ext.repeat(1, self.GQA_GROUP_SIZE, 1, 1)
+        # v_ext = v_ext.repeat(1, self.GQA_GROUP_SIZE, 1, 1)
         print("Manual KV update....")
         print("k_ext , v_ext : ", k_ext.shape, v_ext.shape)
         print("Chunking and pushing into pre-allocated cache.")
+        k = ttnn.from_torch(
+            k_ext, device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT
+        )
+        v = ttnn.from_torch(
+            v_ext, device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT
+        )
+        ttnn.fill_cache(self.K_past, k, batch_idx=0)
+        ttnn.fill_cache(self.V_past, v, batch_idx=0)
+        self.kv_len = k.shape[2]
 
         # Chunk this
+        """
         n_tokens_in_ext = k_ext.shape[2]
-        n_chunks = int(n_tokens_in_ext / self.KV_MAX_CHUNK_SIZE)
-        if n_tokens_in_ext / self.KV_MAX_CHUNK_SIZE > n_chunks:
-            n_chunks += 1
+        n_chunks        = int(n_tokens_in_ext / self.KV_MAX_CHUNK_SIZE)
+        if (n_tokens_in_ext / self.KV_MAX_CHUNK_SIZE) > n_chunks:
+            n_chunks    += 1
 
+        print("Populating KV from ext : chunk size ", self.KV_MAX_CHUNK_SIZE)
         for j in range(n_chunks):
-            print("Populating KV from ext : chunk size ", self.KV_MAX_CHUNK_SIZE)
             start = int(j * self.KV_MAX_CHUNK_SIZE)
-            end = int((j + 1) * self.KV_MAX_CHUNK_SIZE)
+            end   = int((j + 1) * self.KV_MAX_CHUNK_SIZE)
             if end > n_tokens_in_ext:
                 end = n_tokens_in_ext
             k_chunk = k_ext[:, :, start:end, :]
             v_chunk = v_ext[:, :, start:end, :]
 
-            k_chunk = ttnn.from_torch(
-                k_chunk,
-                device=device,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                dtype=ttnn.bfloat16,
-                layout=ttnn.TILE_LAYOUT,
-            )
-            v_chunk = ttnn.from_torch(
-                v_chunk,
-                device=device,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                dtype=ttnn.bfloat16,
-                layout=ttnn.TILE_LAYOUT,
-            )
+            k_chunk = ttnn.from_torch(k_chunk,device=device,memory_config=ttnn.DRAM_MEMORY_CONFIG,dtype=ttnn.bfloat16,layout=ttnn.TILE_LAYOUT)
+            v_chunk = ttnn.from_torch(v_chunk,device=device,memory_config=ttnn.DRAM_MEMORY_CONFIG,dtype=ttnn.bfloat16,layout=ttnn.TILE_LAYOUT)
             print("Trying to push : ", k_chunk.shape, v_chunk.shape)
             if self.kv_len == 0:
                 ttnn.fill_cache(self.K_past, k_chunk, batch_idx=0)
@@ -753,8 +754,38 @@ class AttentionBlock:
                 ttnn.update_cache(self.V_past, v_chunk, update_idx=self.kv_len, batch_offset=0)
             self.kv_len += k_chunk.shape[2]
             print("KV updated... current kv length : ", self.kv_len)
+        """
+        # chunk this
 
-        print("Manual KV add complete...")
+        print("Manual KV add complete. Verifying adds..")
+
+        K_filled = ttnn.slice(self.K_past, (0, 0, 0, 0), (self.BATCH_SIZE, self.N_KVHEADS, self.kv_len, self.HEAD_DIM))
+        V_filled = ttnn.slice(self.V_past, (0, 0, 0, 0), (self.BATCH_SIZE, self.N_KVHEADS, self.kv_len, self.HEAD_DIM))
+        print("K and V filled shapes : ", K_filled.shape, V_filled.shape)
+        K_filled = ttnn.to_torch(ttnn.from_device(K_filled)).to(torch.bfloat16)
+        V_filled = ttnn.to_torch(ttnn.from_device(V_filled)).to(torch.bfloat16)
+        errors_k = torch.abs((K_filled - k_ext))
+        mean_error_k = torch.mean(errors_k)
+        max_error_k = torch.max(errors_k)
+        print("K errors        : ", mean_error_k, max_error_k)
+        print("Pcc (K) : ", pcc(K_filled, k_ext))
+        print(
+            "All close check : ",
+            torch.allclose(K_filled, k_ext, atol=1e-04, rtol=1e-02),
+        )
+        errors_v = torch.abs((V_filled - v_ext))
+        mean_error_v = torch.mean(errors_v)
+        max_error_v = torch.max(errors_v)
+        print("V errors        : ", mean_error_v, max_error_v)
+        print("Pcc (V) : ", pcc(V_filled, v_ext))
+        print(
+            "All close check : ",
+            torch.allclose(V_filled, v_ext, atol=1e-04, rtol=1e-02),
+        )
+        print("Verification complete..")
+
+        # K_filled.deallocate(True)
+        # V_filled.deallocate(True)
 
     def _compute_attention_with_cache(self, q_rotated, k_current, v_current, attention_mask=None):
         """
@@ -815,8 +846,11 @@ class AttentionBlock:
         seq_len = q_rotated.shape[2]
 
         # Slice the cache to only use filled portion
-        K_filled = ttnn.slice(self.K_past, (0, 0, 0, 0), (self.BATCH_SIZE, self.N_QHEADS, self.kv_len, self.HEAD_DIM))
-        V_filled = ttnn.slice(self.V_past, (0, 0, 0, 0), (self.BATCH_SIZE, self.N_QHEADS, self.kv_len, self.HEAD_DIM))
+        K_filled = ttnn.slice(self.K_past, (0, 0, 0, 0), (self.BATCH_SIZE, self.N_KVHEADS, self.kv_len, self.HEAD_DIM))
+        V_filled = ttnn.slice(self.V_past, (0, 0, 0, 0), (self.BATCH_SIZE, self.N_KVHEADS, self.kv_len, self.HEAD_DIM))
+        # Expand here
+        K_filled = ttnn.repeat(K_filled, [1, self.GQA_GROUP_SIZE, 1, 1])
+        V_filled = ttnn.repeat(V_filled, [1, self.GQA_GROUP_SIZE, 1, 1])
         print(f"Using filled KV cache: {K_filled.shape}, {V_filled.shape} (filled: {self.kv_len}/{self.max_capacity})")
 
         K_permuted = ttnn.permute(K_filled, (0, 1, 3, 2))  # [batch, heads, head_dim, total_seq_len]
@@ -894,8 +928,8 @@ class AttentionBlock:
         self.max_capacity = max_capacity
         # KV cache dimensions: [batch, n_heads, seq_len, head_dim]
         # GQA: n_heads = N_QHEADS (after expansion)
-        k_cache = torch.zeros(self.BATCH_SIZE, self.N_QHEADS, max_capacity, self.HEAD_DIM)
-        v_cache = torch.zeros(self.BATCH_SIZE, self.N_QHEADS, max_capacity, self.HEAD_DIM)
+        k_cache = torch.zeros((self.BATCH_SIZE, self.N_KVHEADS, max_capacity, self.HEAD_DIM), dtype=torch.bfloat16)
+        v_cache = torch.zeros((self.BATCH_SIZE, self.N_KVHEADS, max_capacity, self.HEAD_DIM), dtype=torch.bfloat16)
 
         self.K_past = ttnn.as_tensor(
             k_cache,
@@ -920,19 +954,15 @@ class AttentionBlock:
 
     def _update_kv_cache(self, k_new, v_new):
         print("Updating KV cache...")
-
-        # Simple concatenation - the cache is already the right size!
         print("KV shapes : ", k_new.shape, v_new.shape)
+        n_updates = k_new.shape[2]
         if self.kv_len == 0:
             ttnn.fill_cache(self.K_past, k_new, batch_idx=0)
             ttnn.fill_cache(self.V_past, v_new, batch_idx=0)
         else:
-            ttnn.update_cache(self.K_past, k_new, update_idx=self.kv_len, batch_offset=0)
-            ttnn.update_cache(self.V_past, v_new, update_idx=self.kv_len, batch_offset=0)
-
-        # If  cache overfill
-        # For later
-        # If  cache overfill
+            for j in range(n_updates):
+                ttnn.update_cache(self.K_past, k_new[:, :, j, :], update_idx=self.kv_len + j, batch_offset=0)
+                ttnn.update_cache(self.V_past, v_new[:, :, j, :], update_idx=self.kv_len + j, batch_offset=0)
 
         # Update cache length
         self.kv_len += k_new.shape[2]
@@ -1246,8 +1276,8 @@ def rms_norm(x, norm_weights):
 
 
 def pcc(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    x = x.view(-1).float()
-    y = y.view(-1).float()
+    x = x.reshape(-1).float()
+    y = y.reshape(-1).float()
 
     vx = x - x.mean()
     vy = y - y.mean()
@@ -1257,13 +1287,13 @@ def pcc(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 if __name__ == "__main__":
+    # Load reference example
     root = os.getcwd()
     ref_data_path = os.path.join(root, "reference_data")
-    # Load reference example
     example = torch.load(os.path.join(ref_data_path, "example_with_intermediates.pt"))
     # Load reference example
 
-    # Example usage of the AttentionBlock class
+    # Example use of the AttentionBlock class
     print("Opening device")
     device = ttnn.open_device(device_id=0)
     try:
@@ -1310,19 +1340,22 @@ if __name__ == "__main__":
         rtol = 1e-02
 
         # Check RoPE : Inputs
+        print("")
+        print("RoPE inputs / QKV out")
         rope_inputs_q_tt_model = tt_intermediates["q_proj"]
         rope_inputs_k_tt_model = tt_intermediates["k_proj"]
-        rope_inputs_q_reference = example["outputs/intermediates"]["q_pre_rope"]
-        rope_inputs_k_reference = example["outputs/intermediates"]["k_pre_rope"]
-        print("Shape check : q : ", rope_inputs_q_tt_model.shape, rope_inputs_q_reference.shape)
-        print("Shape check : k : ", rope_inputs_k_tt_model.shape, rope_inputs_k_reference.shape)
         rope_inputs_q_tt_model = ttnn.to_torch(ttnn.from_device(rope_inputs_q_tt_model)).to(torch.bfloat16)
         rope_inputs_k_tt_model = ttnn.to_torch(ttnn.from_device(rope_inputs_k_tt_model)).to(torch.bfloat16)
+
+        rope_inputs_q_reference = example["outputs/intermediates"]["q_pre_rope"]
+        rope_inputs_k_reference = example["outputs/intermediates"]["k_pre_rope"]
+
         errors_q = torch.abs((rope_inputs_q_tt_model - rope_inputs_q_reference))
         mean_error_q = torch.mean(errors_q)
         max_error_q = torch.max(errors_q)
         print("Q errors        : ", mean_error_q, max_error_q)
-        print(rope_inputs_q_tt_model.dtype, rope_inputs_q_reference.dtype)
+        print("Pcc (Q) : ", pcc(rope_inputs_q_tt_model, rope_inputs_q_reference))
+        # print(rope_inputs_q_tt_model.dtype, rope_inputs_q_reference.dtype)
         print(
             "All close check : ",
             torch.allclose(rope_inputs_q_tt_model, rope_inputs_q_reference, atol=1e-04, rtol=1e-02),
@@ -1330,7 +1363,8 @@ if __name__ == "__main__":
         errors_k = torch.abs((rope_inputs_k_tt_model - rope_inputs_k_reference))
         mean_error_k = torch.mean(errors_k)
         max_error_k = torch.max(errors_k)
-        print("Q errors        : ", mean_error_k, max_error_k)
+        print("K errors        : ", mean_error_k, max_error_k)
+        print("Pcc (K) : ", pcc(rope_inputs_k_tt_model, rope_inputs_k_reference))
         print(
             "All close check : ",
             torch.allclose(rope_inputs_k_tt_model, rope_inputs_k_reference, atol=1e-04, rtol=1e-02),
@@ -1338,41 +1372,69 @@ if __name__ == "__main__":
         # Check RoPE : Inputs
 
         # Check RoPE : Outputs
+        print("")
+        print("RoPE outputs")
         rope_outputs_q_tt_model = tt_intermediates["q_post_rope"]
         rope_outputs_k_tt_model = tt_intermediates["k_post_rope"]
         rope_outputs_q_reference = example["outputs/intermediates"]["q_post_rope"]
         rope_outputs_k_reference = example["outputs/intermediates"]["k_post_rope"]
-        print("Shape check : q : ", rope_outputs_q_tt_model.shape, rope_outputs_q_reference.shape)
-        print("Shape check : k : ", rope_outputs_k_tt_model.shape, rope_outputs_k_reference.shape)
+        # print("Shape check : q : ", rope_outputs_q_tt_model.shape, rope_outputs_q_reference.shape)
+        # print("Shape check : k : ", rope_outputs_k_tt_model.shape, rope_outputs_k_reference.shape)
         rope_outputs_q_tt_model = ttnn.to_torch(ttnn.from_device(rope_outputs_q_tt_model)).to(torch.bfloat16)
         rope_outputs_k_tt_model = ttnn.to_torch(ttnn.from_device(rope_outputs_k_tt_model)).to(torch.bfloat16)
         errors_q = torch.abs((rope_outputs_q_tt_model - rope_outputs_q_reference))
         mean_error_q = torch.mean(errors_q)
         max_error_q = torch.max(errors_q)
         print("Q errors        : ", mean_error_q, max_error_q)
+        print("Pcc (Q) : ", pcc(rope_outputs_q_tt_model, rope_outputs_q_reference))
+        print(
+            "All close check : ",
+            torch.allclose(rope_outputs_q_tt_model, rope_outputs_q_reference, atol=1e-04, rtol=1e-02),
+        )
+
+        errors_k = torch.abs((rope_outputs_k_tt_model - rope_outputs_k_reference))
+        mean_error_k = torch.mean(errors_k)
+        max_error_k = torch.max(errors_k)
+        print("K errors        : ", mean_error_k, max_error_k)
+        print("Pcc (K) : ", pcc(rope_inputs_k_tt_model, rope_inputs_k_reference))
         print(
             "All close check : ",
             torch.allclose(rope_outputs_q_tt_model, rope_outputs_q_reference, atol=1e-04, rtol=1e-02),
         )
         # Check RoPE : Outputs
 
-        """
-        # Verify intermediates
-        tt_q_proj = ttnn.to_torch(ttnn.from_device(tt_intermediates["q_proj"])).to(dtype=torch.float)
-        torch_q_proj = example["outputs/intermediates"]["q_proj"]
-        print("Torch q proj shape : ", torch_q_proj.shape)
-        errors = torch.abs((torch_q_proj - tt_q_proj))
-        mean_error = torch.mean(errors)
-        max_error = torch.max(errors)
-        print(
-            "torch allclose (atol 1e-04, rtol 1e-02) output : ",
-            torch.allclose(torch_q_proj, tt_q_proj, atol=1e-04, rtol=1e-02),
+        # Check KV cache
+        print("")
+        print("KV cache")
+        kv_filled_len = tt_intermediates["kv_len_pre_attention"]
+        tt_k_past = ttnn.to_torch(ttnn.from_device(tt_intermediates["K_cache_pre_attention"])).to(torch.bfloat16)[
+            :, :, 0:kv_filled_len, :
+        ]
+        tt_k_past = ttnn.to_torch(ttnn.from_device(tt_intermediates["K_cache_pre_attention"])).to(torch.bfloat16)[
+            :, :, 0:kv_filled_len, :
+        ]
+        k_past_reference = torch.cat(
+            [example["outputs/intermediates"]["K_past"], example["outputs/intermediates"]["k_post_rope"]], dim=2
         )
-        print("Mean and Max L1 errors q_projections : ", mean_error, max_error)
-        # Verify intermediates
-        """
+        v_past_reference = torch.cat(
+            [example["outputs/intermediates"]["V_past"], example["outputs/intermediates"]["v_pre_rope"]], dim=2
+        )
+        # k_past_reference= k_past_reference.repeat(1,4,1,1)
+        # v_past_reference= v_past_reference.repeat(1,4,1,1)
+        print(k_past_reference.shape, tt_k_past.shape)
+        errors_k = torch.abs((tt_k_past - k_past_reference))
+        mean_error_k = torch.mean(errors_k)
+        max_error_k = torch.max(errors_k)
+        print("K errors        : ", mean_error_k, max_error_k)
+        print("Pcc (K) : ", pcc(tt_k_past, k_past_reference))
+        print(
+            "All close check : ",
+            torch.allclose(tt_k_past, k_past_reference, atol=1e-04, rtol=1e-02),
+        )
+        # Check KV cache
 
         # Get reference output
+        print("")
         print("Output check.")
         torch_output = example["outputs/ref_output"]
         tt_output = ttnn.to_torch(ttnn.from_device(output)).to(dtype=torch.bfloat16)
