@@ -1,7 +1,11 @@
 import os
+from typing import Optional
 
 import torch
 from attention_utils import check_llama_availability
+from torch import nn
+from transformers import LlamaConfig
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
 import ttnn
 from models.tt_transformers.tt.common import (
@@ -11,6 +15,153 @@ from models.tt_transformers.tt.common import (
     precompute_freqs,
 )
 from models.tt_transformers.tt.rope import RotarySetup
+
+
+# CPU Rope
+def rotate_half(x: torch.Tensor):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
+    """
+    Apply rotary position embeddings to query and key tensors.
+
+    Args:
+        q (torch.Tensor): Query tensor.
+        k (torch.Tensor): Key tensor.
+        cos (torch.Tensor): Cosine values.
+        sin (torch.Tensor): Sine values.
+        position_ids (torch.Tensor): Position IDs.
+
+    Returns:
+        torch.Tensor: Query and key tensors with rotary position embeddings applied.
+    """
+    cos = cos.squeeze(1).squeeze(0)
+    sin = sin.squeeze(1).squeeze(0)
+    cos = cos[position_ids].unsqueeze(1)
+    sin = sin[position_ids].unsqueeze(1)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+def apply_rotary_pos_emb_L31(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    """Applies Rotary Position Embedding to the query and key tensors.
+
+    Args:
+        q (`torch.Tensor`): The query tensor.
+        k (`torch.Tensor`): The key tensor.
+        cos (`torch.Tensor`): The cosine part of the rotary embedding.
+        sin (`torch.Tensor`): The sine part of the rotary embedding.
+        position_ids (`torch.Tensor`, *optional*):
+            Deprecated and unused.
+        unsqueeze_dim (`int`, *optional*, defaults to 1):
+            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
+            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
+            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
+            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
+            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
+            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
+    Returns:
+        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
+    """
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+class LlamaRotaryEmbedding_L31(nn.Module):
+    def __init__(
+        self,
+        dim=None,
+        max_position_embeddings=2048,
+        base=10000,
+        device=None,
+        scaling_factor=1.0,
+        rope_type="default",
+        config: Optional[LlamaConfig] = None,
+    ):
+        super().__init__()
+        # TODO (joao): remove the `if` below, only used for BC
+        self.rope_kwargs = {}
+        if config is None:
+            self.rope_kwargs = {
+                "rope_type": rope_type,
+                "factor": scaling_factor,
+                "dim": dim,
+                "base": base,
+                "max_position_embeddings": max_position_embeddings,
+            }
+            self.rope_type = rope_type
+            self.max_seq_len_cached = max_position_embeddings
+            self.original_max_seq_len = max_position_embeddings
+        else:
+            print("CONFIG NOT NONE")
+            # BC: "rope_type" was originally "type"
+            print("Check : ", config.rope_scaling)
+            if config.rope_scaling is not None:
+                print("ROPE TYPE NOT DEFAULT")
+                self.rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type"))
+            else:
+                self.rope_type = "default"
+            self.max_seq_len_cached = config.max_position_embeddings
+            self.original_max_seq_len = config.max_position_embeddings
+
+        self.config = config
+        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+
+        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device, **self.rope_kwargs)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.original_inv_freq = self.inv_freq
+
+    def _dynamic_frequency_update(self, position_ids, device):
+        """
+        dynamic RoPE layers should recompute `inv_freq` in the following situations:
+        1 - growing beyond the cached sequence length (allow scaling)
+        2 - the current sequence length is in the original scale (avoid losing precision with small sequences)
+        """
+        seq_len = torch.max(position_ids) + 1
+        if seq_len > self.max_seq_len_cached:  # growth
+            inv_freq, self.attention_scaling = self.rope_init_fn(
+                self.config, device, seq_len=seq_len, **self.rope_kwargs
+            )
+            self.register_buffer("inv_freq", inv_freq, persistent=False)  # TODO joao: may break with compilation
+            self.max_seq_len_cached = seq_len
+
+        if seq_len < self.original_max_seq_len and self.max_seq_len_cached > self.original_max_seq_len:  # reset
+            self.register_buffer("inv_freq", self.original_inv_freq, persistent=False)
+            self.max_seq_len_cached = self.original_max_seq_len
+
+    @torch.no_grad()
+    def forward(self, x, position_ids):
+        if "dynamic" in self.rope_type:
+            self._dynamic_frequency_update(position_ids, device=x.device)
+
+        # Core RoPE block
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        position_ids_expanded = position_ids[:, None, :].float()
+        # Force float32 (see https://github.com/huggingface/transformers/pull/29285)
+        device_type = x.device.type
+        device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos()
+            sin = emb.sin()
+
+        # Advanced RoPE types (e.g. yarn) apply a post-processing scaling factor, equivalent to scaling attention
+        cos = cos * self.attention_scaling
+        sin = sin * self.attention_scaling
+
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+
+# CPU Rope
 
 
 class AttentionBlock:
@@ -55,13 +206,14 @@ class AttentionBlock:
         self.MAX_SEQ_LEN = 1024
         self.ATTN_SCALE = 1 / (self.HEAD_DIM**0.5)
 
-        # RoPE configuration
-        self.hf_model_config = {
-            "rope_theta": 500000.0,
-            "original_max_position_embeddings": 8192,
-            "rope_scaling_factor": 8,
-            "max_position_embeddings": 128 * 1024,
-        }
+        self.hf_config_file = None
+        # RoPE configuration : HF model config is basically for RoPE. Can eliminate with a load.
+        # self.hf_model_config = {
+        #    "rope_theta": 500000.0,
+        #    "original_max_position_embeddings": 8192,
+        #    "rope_scaling_factor": 8,
+        #    "max_position_embeddings": 128 * 1024,
+        # }
 
         # Model weights and components
         self.Q = None
@@ -80,11 +232,13 @@ class AttentionBlock:
         self.max_kv_len = 0
 
         # Load weights if model path provided
+        self.rope_cpu = False
         if model_path:
             self.load_weights(model_path, layer_idx)
 
         # Setup RoPE
-        self.setup_rope()
+        if self.hf_config_file is not None:
+            self.setup_rope_cpu()
 
         self.compute_kernel_config_hifi4 = ttnn.WormholeComputeKernelConfig(
             math_fidelity=ttnn.MathFidelity.HiFi4,
@@ -165,7 +319,16 @@ class AttentionBlock:
                 self.HEAD_DIM = config.hidden_size // config.num_attention_heads
                 self.GQA_GROUP_SIZE = int(self.N_QHEADS / self.N_KVHEADS)
 
+                # Check if the directory exists
+                if not model_path.exists():
+                    print(f"Model directory does not exist: {model_path}")
+                # Check for config.json
+                config_file = model_path / "config.json"
+                if not config_file.exists():
+                    print(f"config.json not found at: {config_file}")
+                self.hf_config_file = config_file
                 # Update RoPE config
+                """
                 if hasattr(config, "rope_theta"):
                     self.hf_model_config["rope_theta"] = config.rope_theta
                 if hasattr(config, "rope_scaling"):
@@ -175,6 +338,7 @@ class AttentionBlock:
                         self.hf_model_config[
                             "original_max_position_embeddings"
                         ] = config.rope_scaling.original_max_position_embeddings
+                """
 
                 print(f"Updated model parameters:")
                 print(f"   - Hidden dimension       : {self.MODEL_HIDDEN}")
@@ -302,6 +466,10 @@ class AttentionBlock:
         self.trans_mats_dict = self.rope_setup.get_both_trans_mats()
         print("RoPE init complete")
 
+    def setup_rope_cpu(self):
+        self.rope_cpu = True
+        self.rotary_emb = LlamaRotaryEmbedding_L31(config=LlamaConfig.from_json_file(self.hf_config_file))
+
     def forward(self, input_tokens, position_indices, attention_mask=None):
         """
         Forward pass for K tokens.
@@ -327,10 +495,13 @@ class AttentionBlock:
         intermediates["v_proj"] = v_proj
 
         # Step 2: Rope Prepare + Apply
-        rot_mats = self._prepare_step_rope(position_ids)
-        q_rotated, k_rotated = self._apply_rope(q_proj, k_proj, rot_mats=rot_mats)
-        intermediates["k_post_rope"] = k_rotated
-        intermediates["q_post_rope"] = q_rotated
+        if self.rope_cpu:
+            q_rotated, k_rotated = self._apply_rope_cpu(q_proj, k_proj, position_indices)
+        else:
+            rot_mats = self._prepare_step_rope(position_ids)
+            q_rotated, k_rotated = self._apply_rope(q_proj, k_proj, rot_mats=rot_mats)
+            intermediates["k_post_rope"] = k_rotated
+            intermediates["q_post_rope"] = q_rotated
 
         # Step 3 : Head broadcast, K and V : Can keep cache smaller, optimize for later
         k_rotated = ttnn.repeat(k_rotated, [1, self.GQA_GROUP_SIZE, 1, 1])
@@ -494,6 +665,27 @@ class AttentionBlock:
         )
 
         print(f"QK rotated: {q_rotated.shape}, {k_rotated.shape}")
+        return q_rotated, k_rotated
+
+    def _apply_rope_cpu(self, q, k, pos_ids):
+        q = ttnn.to_torch(ttnn.from_device(q)).to(torch.bfloat16)
+        k = ttnn.to_torch(ttnn.from_device(k)).to(torch.bfloat16)
+        cos, sin = self.rotary_emb(q, pos_ids.to(torch.long))
+        q_rotated, k_rotated = apply_rotary_pos_emb_L31(q, k, cos, sin)
+        q_rotated = ttnn.from_torch(
+            q_rotated,
+            device=self.device,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        k_rotated = ttnn.from_torch(
+            k_rotated,
+            device=self.device,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
         return q_rotated, k_rotated
 
     def _prepare_step_rope(self, position_indices):

@@ -518,9 +518,10 @@ if __name__ == "__main__":
         cos, sin = rotary_emb(rope_in_q, position_ids.to(torch.long))
         cosine_full = cos.unsqueeze(0)
         sine_full = sin.unsqueeze(0)
+        # To torch
         query_states, key_states = apply_rotary_pos_emb_L31(rope_in_q, rope_in_k, cos, sin)
-        # print(query_states.shape, query_states.dtype)
-        # print(key_states.shape, key_states.dtype)
+        # From torch
+
         errors = torch.abs((query_states - rope_out_q))
         print("Max error (q) , Mean error : ", torch.max(errors), torch.mean(errors))
         print("Min and max values     : ", torch.min(query_states), torch.max(query_states))
