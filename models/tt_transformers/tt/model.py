@@ -47,6 +47,17 @@ class Transformer(LightweightModule):
             dtype=ttnn.bfloat16,  # Row major layout requires bfloat16
         )
 
+        print("")
+        print("See : Rope setup parameters")
+        print("Max bs , head dim, max_seq_len , rope_theta, rope_scaling_factor, orig_context_len")
+        print(
+            args.max_batch_size,
+            args.head_dim,
+            args.max_seq_len,
+            args.rope_theta,
+            args.rope_scaling_factor,
+            args.orig_context_len,
+        )
         self.rope_setup = RotarySetup(
             mesh_device,
             args.max_batch_size,
