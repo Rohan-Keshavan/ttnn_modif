@@ -19,7 +19,7 @@ N_ATTENTION_HEADS = 32
 GQA_GROUP_SIZE = 4
 OBSERVE_SEQ_LEN = 60
 
-inputs_from = "random"
+inputs_from = "not_random"
 
 
 def load_attn_weights(layer_idx=0):

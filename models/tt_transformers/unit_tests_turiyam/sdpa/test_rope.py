@@ -15,11 +15,11 @@ class LlamaRotaryEmbedding_L31(nn.Module):
     def __init__(
         self,
         dim=128,
-        max_position_embeddings=2048,
+        max_position_embeddings=8192,
         base=500000.0,
         device=None,
         scaling_factor=8.0,
-        rope_type="default",
+        rope_type="llama3",
         config: Optional[LlamaConfig] = None,
     ):
         super().__init__()
@@ -148,6 +148,7 @@ TORCH_IN_DTYPE = torch.bfloat16
 TORCH_OUT_DTYPE = torch.bfloat16
 TT_IN_DTYPE = ttnn.bfloat16
 TT_OUT_DTYPE = ttnn.bfloat16
+SEQ_LEN = 32
 
 if __name__ == "__main__":
     root = os.getcwd()
@@ -214,12 +215,12 @@ if __name__ == "__main__":
         config = json.load(f)
     print("Llama model congig : ")
     print(config)
-    torch_rope = LlamaRotaryEmbedding_L31(LlamaConfig(**config))
+    torch_rope = LlamaRotaryEmbedding_L31(config=LlamaConfig(**config))
     # Init torch rope
 
     # Get torch rope out
     print("Computing RoPE outputs...")
-    cos, sin = torch_rope(rope_inputs_q_reference, position_ids)
+    cos, sin = torch_rope(rope_inputs_q_reference, torch.tensor(position_ids, dtype=torch.long).unsqueeze(0))
     query_states, key_states = apply_rotary_pos_emb_L31(rope_inputs_q_reference, rope_inputs_k_reference, cos, sin)
     print("RoPE out shapes    : ", query_states.shape, key_states.shape)
     print("RoPE out ranges(q) : ", torch.min(query_states), torch.max(query_states))
@@ -246,7 +247,7 @@ if __name__ == "__main__":
         head_dim=128,
         max_seq_len=2048,
         rope_theta=500000.0,
-        scale_factor=None,
+        scale_factor=8.0,
         orig_context_len=8192,
         datatype=ttnn.float32,
     )
