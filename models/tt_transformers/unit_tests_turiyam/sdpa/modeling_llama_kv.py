@@ -254,8 +254,6 @@ class LlamaRotaryEmbedding_L31(nn.Module):
     def forward(self, x, position_ids):
         if "dynamic" in self.rope_type:
             self._dynamic_frequency_update(position_ids, device=x.device)
-        # x = x.to(torch.bfloat16)
-        # x = x.to(torch.float32)
         # Core RoPE block
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
         position_ids_expanded = position_ids[:, None, :].float()
@@ -613,12 +611,6 @@ class LlamaAttention(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.pretraining_tp = config.pretraining_tp
         self.max_position_embeddings = config.max_position_embeddings
-        print("")
-        print("In attn init ")
-        print("Head dim     : ", self.head_dim)
-        print("num heads    : ", self.num_heads)
-        print("Hidden size  : ", self.hidden_size)
-        print("Heads (q,kv) : ", self.num_heads, self.num_key_value_heads)
         if (self.head_dim * self.num_heads) != self.hidden_size:
             raise ValueError(
                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
@@ -746,9 +738,6 @@ class LlamaAttention(nn.Module):
         print("qkv shapes (post-rope): ", query_states.shape, key_states.shape, value_states.shape)
         print("qkv dtypes (post-rope): ", query_states.dtype, key_states.dtype, value_states.dtype)
 
-        # query_states = query_states.to(torch.float32)
-        # key_states   = key_states.to(torch.float32)
-
         intermediates["q_post_rope"] = query_states
         intermediates["k_post_rope"] = key_states
         # [MODIFIED] Using KVCache mechanism for preallocated GPU memory optimization
@@ -762,6 +751,7 @@ class LlamaAttention(nn.Module):
 
             key_states = torch.cat((past_key_value[0], key_states), dim=2)
             value_states = torch.cat((past_key_value[1], value_states), dim=2)
+
         # Reset past_key_value to avoid return past_key_value.
         past_key_value = None
         # repeat k/v heads if n_kv_heads < n_heads
@@ -769,7 +759,7 @@ class LlamaAttention(nn.Module):
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-        intermediates["attn_weights_pre_softmax"] = attn_weights
+        intermediates["attn_weights_scale_applied"] = attn_weights
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
             raise ValueError(
                 f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
@@ -1532,7 +1522,7 @@ if __name__ == "__main__":
         config = json.load(f)
     print("Llama model congig : ")
     print(config)
-    A = LlamaAttention(LlamaConfig(**config))
+    A = LlamaAttention(LlamaConfig.from_json_file(config_file))
     A._load_qkvo(model_path)
     # Create Llama Attn class and load qkvo
 
@@ -1559,7 +1549,6 @@ if __name__ == "__main__":
     print("Hidden states type after RMS Norm  : ", hidden_states.dtype)
     hidden_states = hidden_states.to(torch.bfloat16)
     print("Post norm range : ", torch.min(hidden_states), torch.max(hidden_states))
-
     example["args/hidden_states_post_norm"] = hidden_states
 
     attention_mask = example["args/attention_mask"]

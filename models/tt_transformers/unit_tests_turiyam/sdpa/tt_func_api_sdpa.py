@@ -360,6 +360,9 @@ class AttentionBlock:
 
         return output, intermediates
 
+    def _forward_attention():
+        return output
+
     def _expand_gqa_weights(self):
         """Expand K and V weights for GQA."""
         print("GQA Weight Expansion: Expanding K and V weights...")
@@ -1112,7 +1115,7 @@ if __name__ == "__main__":
         # Forward pass
 
         atol = 1e-04
-        rtol = 3e-02
+        rtol = 1e-02
 
         # Check RoPE : Inputs
         rope_inputs_q_tt_model = tt_intermediates["q_proj"]
@@ -1121,19 +1124,27 @@ if __name__ == "__main__":
         rope_inputs_k_reference = example["outputs/intermediates"]["k_pre_rope"]
         print("Shape check : q : ", rope_inputs_q_tt_model.shape, rope_inputs_q_reference.shape)
         print("Shape check : k : ", rope_inputs_k_tt_model.shape, rope_inputs_k_reference.shape)
-        rope_inputs_q_tt_model = ttnn.to_torch(ttnn.from_device(rope_inputs_q_tt_model)).to(torch.float32)
-        rope_inputs_k_tt_model = ttnn.to_torch(ttnn.from_device(rope_inputs_k_tt_model)).to(torch.float32)
+        rope_inputs_q_tt_model = ttnn.to_torch(ttnn.from_device(rope_inputs_q_tt_model)).to(torch.bfloat16)
+        rope_inputs_k_tt_model = ttnn.to_torch(ttnn.from_device(rope_inputs_k_tt_model)).to(torch.bfloat16)
         errors_q = torch.abs((rope_inputs_q_tt_model - rope_inputs_q_reference))
         mean_error_q = torch.mean(errors_q)
         max_error_q = torch.max(errors_q)
         print("Q errors        : ", mean_error_q, max_error_q)
+        print(rope_inputs_q_tt_model.dtype, rope_inputs_q_reference.dtype)
         print(
             "All close check : ",
             torch.allclose(rope_inputs_q_tt_model, rope_inputs_q_reference, atol=1e-04, rtol=1e-02),
         )
+        errors_k = torch.abs((rope_inputs_k_tt_model - rope_inputs_k_reference))
+        mean_error_k = torch.mean(errors_k)
+        max_error_k = torch.max(errors_k)
+        print("Q errors        : ", mean_error_k, max_error_k)
+        print(
+            "All close check : ",
+            torch.allclose(rope_inputs_k_tt_model, rope_inputs_k_reference, atol=1e-04, rtol=1e-02),
+        )
         # Check RoPE : Inputs
 
-        """
         # Check RoPE : Outputs
         rope_outputs_q_tt_model = tt_intermediates["q_post_rope"]
         rope_outputs_k_tt_model = tt_intermediates["k_post_rope"]
@@ -1141,8 +1152,8 @@ if __name__ == "__main__":
         rope_outputs_k_reference = example["outputs/intermediates"]["k_post_rope"]
         print("Shape check : q : ", rope_outputs_q_tt_model.shape, rope_outputs_q_reference.shape)
         print("Shape check : k : ", rope_outputs_k_tt_model.shape, rope_outputs_k_reference.shape)
-        rope_outputs_q_tt_model = ttnn.to_torch(ttnn.from_device(rope_outputs_q_tt_model)).to(torch.float32)
-        rope_outputs_k_tt_model = ttnn.to_torch(ttnn.from_device(rope_outputs_k_tt_model)).to(torch.float32)
+        rope_outputs_q_tt_model = ttnn.to_torch(ttnn.from_device(rope_outputs_q_tt_model)).to(torch.bfloat16)
+        rope_outputs_k_tt_model = ttnn.to_torch(ttnn.from_device(rope_outputs_k_tt_model)).to(torch.bfloat16)
         errors_q = torch.abs((rope_outputs_q_tt_model - rope_outputs_q_reference))
         mean_error_q = torch.mean(errors_q)
         max_error_q = torch.max(errors_q)
@@ -1152,7 +1163,6 @@ if __name__ == "__main__":
             torch.allclose(rope_outputs_q_tt_model, rope_outputs_q_reference, atol=1e-04, rtol=1e-02),
         )
         # Check RoPE : Outputs
-        """
 
         """
         # Verify intermediates
@@ -1173,7 +1183,7 @@ if __name__ == "__main__":
         # Get reference output
         print("Output check.")
         torch_output = example["outputs/ref_output"]
-        tt_output = ttnn.to_torch(ttnn.from_device(output)).to(dtype=torch.float)
+        tt_output = ttnn.to_torch(ttnn.from_device(output)).to(dtype=torch.bfloat16)
         errors = torch.abs((torch_output - tt_output))
         mean_error = torch.mean(errors)
         max_error = torch.max(errors)
