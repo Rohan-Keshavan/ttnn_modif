@@ -469,10 +469,21 @@ if __name__ == "__main__":
     )
 
     rope_out_q_tt = ttnn.experimental.rotary_embedding_llama(
-        rope_in_q, cos_matrix, sin_matrix, transformation_mat_prefill, is_decode_mode=False
+        rope_in_q_tt, cos_matrix, sin_matrix, transformation_mat_prefill, is_decode_mode=False
     )
     rope_out_k_tt = ttnn.experimental.rotary_embedding_llama(
-        rope_in_k, cos_matrix, sin_matrix, transformation_mat_prefill, is_decode_mode=False
+        rope_in_k_tt, cos_matrix, sin_matrix, transformation_mat_prefill, is_decode_mode=False
+    )
+
+    q_rotated = ttnn.to_torch(ttnn.from_device(rope_out_q_tt)).to(torch.bfloat16)
+    k_rotated = ttnn.to_torch(ttnn.from_device(rope_out_k_tt)).to(torch.bfloat16)
+
+    errors = torch.abs((q_rotated - rope_out_q))
+    print("Max error (q) , Mean error : ", torch.max(errors), torch.mean(errors))
+    print("Min and max values     : ", torch.min(q_rotated), torch.max(q_rotated))
+    print(
+        "Is close   : ",
+        (torch.isclose(q_rotated, rope_out_q, atol=ATOL, rtol=RTOL)).float().mean().item() * 100,
     )
 
     EAGLE_FORWARD = False
