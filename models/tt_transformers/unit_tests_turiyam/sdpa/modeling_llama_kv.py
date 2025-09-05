@@ -777,7 +777,6 @@ class LlamaAttention(nn.Module):
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         intermediates["attn_weights_post_softmax"] = attn_weights
         attn_output = torch.matmul(attn_weights, value_states)
-        intermediates["attn_outputs"] = attn_output
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
                 f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
@@ -786,6 +785,7 @@ class LlamaAttention(nn.Module):
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+        intermediates["attn_outputs"] = attn_output
         print("qkv dtypes (post-rope): ", attn_output.dtype)
 
         if self.pretraining_tp > 1:
@@ -1552,6 +1552,7 @@ if __name__ == "__main__":
     example["args/hidden_states_post_norm"] = hidden_states
 
     attention_mask = example["args/attention_mask"]
+    print(attention_mask)
     position_ids = example["args/position_ids"]
     past_key_value = example["args/past_key_value"]
     past_k = past_key_value[0][:, :, 0 : attention_mask.shape[3] - attention_mask.shape[2], :]

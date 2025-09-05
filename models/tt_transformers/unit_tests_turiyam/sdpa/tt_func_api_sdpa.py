@@ -162,6 +162,57 @@ class LlamaRotaryEmbedding_L31(nn.Module):
 
 
 # CPU Rope
+def compute_attention_with_cache_and_current(K_past, V_past, q_rotated, k_current, v_current, attention_mask=None):
+    """Compute attention using KV cache + current tokens."""
+
+    kv_len = K_past.shape[2]
+    compute_kernel_config_hifi4 = ttnn.WormholeComputeKernelConfig(
+        math_fidelity=ttnn.MathFidelity.HiFi4, math_approx_mode=False, fp32_dest_acc_en=True, packer_l1_acc=True
+    )
+    ATTN_SCALE = 1 / (128**0.5)
+
+    # attention_mask is                                                                                                                                                                                                                                                                                                                                                                    square
+    seq_len = q_rotated.shape[2]
+
+    # Get the relevant KV slice, Expand K and V
+    K_filled = ttnn.slice(K_past, (0, 0, 0, 0), (1, 8, kv_len, 128))
+    V_filled = ttnn.slice(V_past, (0, 0, 0, 0), (1, 8, kv_len, 128))
+    K_filled = ttnn.repeat(K_filled, [1, 4, 1, 1])
+    V_filled = ttnn.repeat(V_filled, [1, 4, 1, 1])
+    # Get the relevant KV slice, Expand K and V
+
+    # Compute attention scores: Q @ K^T
+    qkt_past = ttnn.linear(
+        q_rotated, K_filled, transpose_b=True, compute_kernel_config=compute_kernel_config_hifi4
+    )  # was q_permuted  # [batch, heads, seq_len, total_seq_len]
+    qkt_past = qkt_past * ATTN_SCALE  # No mask needed
+
+    # repeat and permute k
+    k_current = ttnn.repeat(k_current, [1, 4, 1, 1])
+    qkt_current = ttnn.linear(q_rotated, k_current, transpose_b=True, compute_kernel_config=compute_kernel_config_hifi4)
+    print("qkt_past and qkt shapes  : ", qkt_past.shape, qkt_current.shape)
+
+    # Apply attention mask if provided
+    if attention_mask is not None:
+        # print('TT attention mask : ' , attention_mask)
+
+        print("Attn mask shape | dtype      : ", attention_mask.shape, attention_mask.dtype)
+        qkt_current = ttnn.typecast(qkt_current, dtype=ttnn.float32)
+        qkt_current += attention_mask
+        qkt_current = qkt_current * ATTN_SCALE
+        qkt_current = ttnn.typecast(qkt_current, dtype=ttnn.bfloat16)
+
+    # Concat prefix and current qkts
+    qkt = ttnn.concat([qkt_past, qkt_current], dim=-1)
+    print("QKT shape : ", qkt.shape)
+
+    # Softmax and attention output
+    qkt = ttnn.typecast(qkt, dtype=ttnn.float32)
+    qkt = ttnn.softmax(qkt, dim=-1)
+    qkt = ttnn.typecast(qkt, dtype=ttnn.bfloat16)
+    print("Overall qkt and v shape : ", qkt.shape, v_current.shape, V_filled.shape)
+    # Softmax and attention output
+    return qkt
 
 
 class AttentionBlock:
@@ -187,6 +238,7 @@ class AttentionBlock:
         """
         print("")
         print("Setting up the attention layer...")
+
         self.device = device
         self.model_path = model_path
         self.layer_idx = layer_idx
@@ -197,7 +249,7 @@ class AttentionBlock:
         self.N_KVHEADS = 8  # Default for LLaMA 8B (GQA)
         self.HEAD_DIM = 128  # Default: 4096 // 32
         self.GQA_GROUP_SIZE = int(self.N_QHEADS / self.N_KVHEADS)
-        self.KV_MAX_CHUNK_SIZE = 32
+        # self.KV_MAX_CHUNK_SIZE = 32
 
         # TT-Metal settings
         self.TILE_SIZE = 32
@@ -205,15 +257,9 @@ class AttentionBlock:
         self.MAX_BATCH_SIZE = 1
         self.MAX_SEQ_LEN = 1024
         self.ATTN_SCALE = 1 / (self.HEAD_DIM**0.5)
+        # self.ATTN_SCALE = ttnn.from_torch(self.ATTN_SCALE,dtype=ttnn.float32,device=self.device,memory_config=ttnn.DRAM_MEMORY_CONFIG,layout=ttnn.TILE_LAYOUT)
 
         self.hf_config_file = None
-        # RoPE configuration : HF model config is basically for RoPE. Can eliminate with a load.
-        # self.hf_model_config = {
-        #    "rope_theta": 500000.0,
-        #    "original_max_position_embeddings": 8192,
-        #    "rope_scaling_factor": 8,
-        #    "max_position_embeddings": 128 * 1024,
-        # }
 
         # Model weights and components
         self.Q = None
@@ -230,6 +276,7 @@ class AttentionBlock:
         self.V_past = None
         self.kv_len = 0
         self.max_kv_len = 0
+        # KV cache
 
         # Load weights if model path provided
         self.rope_cpu = False
@@ -241,14 +288,11 @@ class AttentionBlock:
             self.setup_rope_cpu()
 
         self.compute_kernel_config_hifi4 = ttnn.WormholeComputeKernelConfig(
-            math_fidelity=ttnn.MathFidelity.HiFi4,
-            math_approx_mode=False,
-            fp32_dest_acc_en=True,
-            packer_l1_acc=True,
+            math_fidelity=ttnn.MathFidelity.HiFi4, math_approx_mode=False, fp32_dest_acc_en=True, packer_l1_acc=True
         )
+
         # Initialize KV cache
         self.init_kv_cache(max_capacity=2048)
-        print("")
         print("Setup complete...")
         print("")
 
@@ -510,17 +554,21 @@ class AttentionBlock:
         # v_proj                              = ttnn.repeat(v_proj    , [1, self.GQA_GROUP_SIZE, 1, 1])
         # Head broadcast,         K and V : Can keep cache smaller, optimize for later
 
-        # Step 4: Update KV cache
-        self._update_kv_cache(k_rotated, v_proj)
-        print(f"KV updated. Current cache length: {self.kv_len}")
+        # Step 4: Update KV cache : Skip the update ? Makes more sense actually. Update post verification.
+        # self._update_kv_cache(k_rotated, v_proj)
+        # print(f"KV updated. Current cache length: {self.kv_len}")
         intermediates["K_cache_pre_attention"] = self.K_past
         intermediates["V_cache_pre_attention"] = self.V_past
         intermediates["kv_len_pre_attention"] = self.kv_len
         # Step 4: Update KV cache
 
         # Step 5: Attention
-        attn_out = self._compute_attention_with_cache(q_rotated, k_rotated, v_proj, attention_mask)
+        attn_out, attention_intermediates = self._compute_attention_with_cache(
+            q_rotated, k_rotated, v_proj, attention_mask
+        )
         print(f"Attention output: {attn_out.shape}")
+        intermediates["attention_intermediates"] = attention_intermediates
+        intermediates["attention_output"] = attn_out
         # Step 5: Attention
 
         # Step 6: Output projection
@@ -723,8 +771,10 @@ class AttentionBlock:
         v = ttnn.from_torch(
             v_ext, device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT
         )
-        ttnn.fill_cache(self.K_past, k, batch_idx=0)
-        ttnn.fill_cache(self.V_past, v, batch_idx=0)
+        ttnn.fill_cache(self.K_past, k, batch_idx=0)  # might have a max seq len limitation. Unit test this. Or go paged
+        ttnn.fill_cache(
+            self.V_past, v, batch_idx=0
+        )  # might have a max seq len limitation. Unit test this. Or go paged.
         self.kv_len = k.shape[2]
 
         # Chunk this
@@ -759,6 +809,7 @@ class AttentionBlock:
 
         print("Manual KV add complete. Verifying adds..")
 
+        """
         K_filled = ttnn.slice(self.K_past, (0, 0, 0, 0), (self.BATCH_SIZE, self.N_KVHEADS, self.kv_len, self.HEAD_DIM))
         V_filled = ttnn.slice(self.V_past, (0, 0, 0, 0), (self.BATCH_SIZE, self.N_KVHEADS, self.kv_len, self.HEAD_DIM))
         print("K and V filled shapes : ", K_filled.shape, V_filled.shape)
@@ -783,7 +834,7 @@ class AttentionBlock:
             torch.allclose(V_filled, v_ext, atol=1e-04, rtol=1e-02),
         )
         print("Verification complete..")
-
+        """
         # K_filled.deallocate(True)
         # V_filled.deallocate(True)
 
@@ -840,77 +891,110 @@ class AttentionBlock:
         print(f"Self-attention output: {attn_out.shape}")
         return attn_out
 
+    def _compute_attention_block(self, q, k, v, mask=None):
+        # q, k , v are ttnn tensors on device
+        qkt = ttnn.linear(
+            q, k, transpose_b=True, dtype=ttnn.bfloat16, compute_kernel_config=self.compute_kernel_config_hifi4
+        )
+        if mask is not None:
+            qkt = ttnn.typecast(qkt, dtype=ttnn.float32)
+            qkt += attention_mask
+            qkt = ttnn.typecast(qkt, dtype=ttnn.bfloat16)
+
+        qkt = qkt * self.ATTN_SCALE
+
+        qkt = ttnn.typecast(qkt, dtype=ttnn.float32)
+        qkt = ttnn.softmax(qkt, dim=-1)
+        log_sum_exponent = ttnn.sum(qkt, dim=-1)
+        qkt = ttnn.typecast(qkt, dtype=ttnn.bfloat16)
+
+        attn = ttnn.linear(qkt, v)
+        attn = ttnn.permute(attn, (0, 2, 1, 3))
+        return qkt, log_sum_exponent
+
     def _compute_attention_with_cache_and_current(self, q_rotated, k_current, v_current, attention_mask=None):
         """Compute attention using KV cache + current tokens."""
+
         print("Computing attention with cache + current tokens...")
+        attention_intermediates = {}
+
+        # attention_mask is                                                                                                                                                                                                                                                                                                                                                                    square
         seq_len = q_rotated.shape[2]
 
-        # Slice the cache to only use filled portion
+        # Get the relevant KV slice, Expand K and V
         K_filled = ttnn.slice(self.K_past, (0, 0, 0, 0), (self.BATCH_SIZE, self.N_KVHEADS, self.kv_len, self.HEAD_DIM))
         V_filled = ttnn.slice(self.V_past, (0, 0, 0, 0), (self.BATCH_SIZE, self.N_KVHEADS, self.kv_len, self.HEAD_DIM))
-        # Expand here
         K_filled = ttnn.repeat(K_filled, [1, self.GQA_GROUP_SIZE, 1, 1])
         V_filled = ttnn.repeat(V_filled, [1, self.GQA_GROUP_SIZE, 1, 1])
         print(f"Using filled KV cache: {K_filled.shape}, {V_filled.shape} (filled: {self.kv_len}/{self.max_capacity})")
-
-        K_permuted = ttnn.permute(K_filled, (0, 1, 3, 2))  # [batch, heads, head_dim, total_seq_len]
-        print("K filled and K permuted shape : ", K_filled.shape)
-        print("V filled and V permuted shape : ", V_filled.shape)
+        # Get the relevant KV slice, Expand K and V
 
         # Compute attention scores: Q @ K^T
-        QKT = ttnn.matmul(q_rotated, K_permuted)  # was q_permuted  # [batch, heads, seq_len, total_seq_len]
-        QKT = QKT * self.ATTN_SCALE
+        qkt_past = ttnn.linear(
+            q_rotated, K_filled, transpose_b=True, compute_kernel_config=self.compute_kernel_config_hifi4
+        )  # was q_permuted  # [batch, heads, seq_len, total_seq_len]
+        qkt_past = qkt_past * self.ATTN_SCALE  # No mask needed
+        attention_intermediates["qkt_past"] = qkt_past
+
+        # repeat and permute k
+        k_current = ttnn.repeat(k_current, [1, self.GQA_GROUP_SIZE, 1, 1])
+        qkt_current = ttnn.linear(
+            q_rotated, k_current, transpose_b=True, compute_kernel_config=self.compute_kernel_config_hifi4
+        )
+        print("qkt_past and qkt shapes  : ", qkt_past.shape, qkt_current.shape)
 
         # Apply attention mask if provided
         if attention_mask is not None:
-            print("Attn mask shape : ", attention_mask.shape)
-            print("Sequence length, kv length : ", seq_len, self.kv_len)
-            # Encode batch size better.
-            if seq_len != self.kv_len:
-                # Assert batch size
-                M_prefix = torch.ones(self.BATCH_SIZE, 1, seq_len, self.kv_len - seq_len)
-                attention_mask = torch.cat([M_prefix, attention_mask], dim=-1)
-            attention_mask = torch.clamp(torch.log(attention_mask), min=-1e09)
-            attention_mask = attention_mask.repeat(1, self.N_QHEADS, 1, 1)
-            attention_mask = ttnn.as_tensor(
-                attention_mask,
-                device=device,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                dtype=ttnn.bfloat16,
-                layout=ttnn.TILE_LAYOUT,
-            )
-            QKT += attention_mask
+            # print('TT attention mask : ' , attention_mask)
+
+            print("Attn mask shape | dtype      : ", attention_mask.shape, attention_mask.dtype)
+            print("Sequence length, kv length   : ", seq_len, self.kv_len)
+            qkt_current = ttnn.typecast(qkt_current, dtype=ttnn.float32)
+            # qkt_current                     += attention_mask
+            qkt_current = qkt_current * self.ATTN_SCALE
+            qkt_current = ttnn.typecast(qkt_current, dtype=ttnn.bfloat16)
+            attention_intermediates["qkt_current"] = qkt_current
+
+        # Concat prefix and current qkts
+        qkt = ttnn.concat([qkt_past, qkt_current], dim=-1)
+        attention_intermediates["qkt"] = qkt
+        print("QKT shape : ", qkt.shape)
 
         # Softmax and attention output
-        QKT = ttnn.softmax(QKT, dim=-1)
-        attn_out = ttnn.matmul(QKT, V_filled)  # [batch, heads, seq_len, head_dim]
-        print("Attn out shape : ", attn_out.shape)
-        # Reshape back to [seq_len, batch, heads, head_dim]
-        attn_out = ttnn.permute(attn_out, (0, 2, 1, 3))
+        qkt = ttnn.typecast(qkt, dtype=ttnn.float32)
+        qkt = ttnn.softmax(qkt, dim=-1)
+        qkt = ttnn.typecast(qkt, dtype=ttnn.bfloat16)
+        print("Overall qkt and v shape : ", qkt.shape, v_current.shape, V_filled.shape)
+        # Softmax and attention output
 
-        print(f"Attention output: {attn_out.shape}")
+        v_current = ttnn.repeat(v_current, [1, self.GQA_GROUP_SIZE, 1, 1])
+        v_complete = ttnn.concat([V_filled, v_current], dim=2)
+
+        attn_out = ttnn.linear(qkt, v_complete)  # [batch, heads, seq_len, head_dim] #v mul can also be split
+        print("Attn out shape : ", attn_out.shape)
+
+        attn_out = ttnn.permute(attn_out, (0, 2, 1, 3))  # Reshape back to [seq_len, batch, heads, head_dim]
+        attn_out = ttnn.to_layout(attn_out, layout=ttnn.ROW_MAJOR_LAYOUT)
+        attn_out = ttnn.reshape(attn_out, (self.BATCH_SIZE, -1, self.MODEL_HIDDEN))
+        attn_out = ttnn.to_layout(attn_out, layout=ttnn.TILE_LAYOUT)
 
         # Clean up intermediate tensors
         K_filled.deallocate(True)
         V_filled.deallocate(True)
-        K_permuted.deallocate(True)
-        # V_permuted.deallocate(True)
+        qkt_past.deallocate(True)
+        qkt_current.deallocate(True)
+        qkt.deallocate(True)
+        # Clean up intermediate tensors
 
-        return attn_out
+        return attn_out, attention_intermediates
 
     def _output_projection(self, attn_out):
         """Apply output projection."""
         print("Output projection...")
-
-        # Reshape and apply output projection
-        attn_out = ttnn.to_layout(attn_out, layout=ttnn.ROW_MAJOR_LAYOUT)
-        attn_out = ttnn.reshape(attn_out, (self.BATCH_SIZE, -1, self.MODEL_HIDDEN))
-        attn_out = ttnn.to_layout(attn_out, layout=ttnn.TILE_LAYOUT)
-        # output = ttnn.linear(attn_out, self.O)
         output = ttnn.linear(
             attn_out,
             self.O,
-            dtype=ttnn.float32,
+            dtype=ttnn.bfloat16,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             compute_kernel_config=self.compute_kernel_config_hifi4,
         )
@@ -1286,6 +1370,59 @@ def pcc(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return corr
 
 
+def prepare_attention_in(example, device):
+    K_past = example["outputs/intermediates"]["K_past"]
+    V_past = example["outputs/intermediates"]["V_past"]
+    q_rotated = example["outputs/intermediates"]["q_post_rope"]
+    k_rotated = example["outputs/intermediates"]["k_post_rope"]
+    v_states = example["outputs/intermediates"]["v_pre_rope"]
+    attn_mask = example["args/attention_mask"]
+    K_past = ttnn.from_torch(
+        K_past, device=device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG
+    )
+    V_past = ttnn.from_torch(
+        V_past, device=device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG
+    )
+    q_rotated = ttnn.from_torch(
+        q_rotated, device=device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG
+    )
+    k_rotated = ttnn.from_torch(
+        k_rotated, device=device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG
+    )
+    v_states = ttnn.from_torch(
+        v_states, device=device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG
+    )
+    attn_mask = attn_mask[:, :, :, attn_mask.shape[3] - attn_mask.shape[2] :]
+    attn_mask = ttnn.as_tensor(
+        attn_mask, device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT
+    )
+    ref_out = example["outputs/intermediates"]["attn_weights_post_softmax"]
+    return K_past, V_past, q_rotated, k_rotated, v_states, attn_mask, ref_out
+
+
+def compare_torch_tt(x_tt, x_torch, device):
+    # Shape and dtype check
+    x_tt = ttnn.to_torch(ttnn.from_device(x_tt))
+    mask = torch.isclose(x_tt, x_torch, atol=1e-03, rtol=1e-01)
+    fail_fraction = mask.float().mean().item()
+    fail_percent = fail_fraction * 100
+    print("Input range (tt)     : ", torch.min(x_tt), torch.max(x_tt))
+    print("Input range  (torch) : ", torch.min(x_torch), torch.max(x_torch))
+    print("Fail percent         : ", fail_percent)
+    print("Pcc                  : ", pcc(x_tt, x_torch))
+
+    # Get indices where it's False
+    mismatch_idx = torch.nonzero(~mask, as_tuple=False)
+
+    # Collect mismatched values from both tensors
+    mismatches = [(idx.tolist(), x_tt[tuple(idx)].item(), x_torch[tuple(idx)].item()) for idx in mismatch_idx]
+
+    for idx, va, vb in mismatches:
+        print(f"Index {idx}: a={va}, b={vb}")
+
+    return
+
+
 if __name__ == "__main__":
     # Load reference example
     root = os.getcwd()
@@ -1320,6 +1457,17 @@ if __name__ == "__main__":
         )
         # Setup tt inputs
 
+        print("Input attention mask : ", attention_mask.shape, attention_mask.dtype)
+        print("Attention mask m/M   : ", torch.min(attention_mask), torch.max(attention_mask))
+        attention_mask = torch.clamp(attention_mask, min=-1e09)
+        attention_mask = ttnn.as_tensor(
+            attention_mask,
+            device=device,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            dtype=ttnn.float32,
+            layout=ttnn.TILE_LAYOUT,
+        )
+
         # Setup prefix KV cache on tt
         print("")
         print("Trying to forward with..")
@@ -1328,140 +1476,196 @@ if __name__ == "__main__":
         attention_block.manual_kv_add(past_k, past_v)
         # Setup prefix KV cache on tt
 
-        # Forward pass
-        output, tt_intermediates = attention_block.forward(
-            input_tokens=hidden_states, position_indices=position_ids, attention_mask=attention_mask
-        )
-        print("")
-        print(f"First forward pass output: {output.shape}")
-        # Forward pass
+        MODEL_FORWARD = False
+        ATTN_TEST = True
 
-        atol = 1e-04
-        rtol = 1e-02
+        if ATTN_TEST:
+            kv_k, kv_v, qr, kr, v, attn_mask, ref_out = prepare_attention_in(example=example, device=device)
+            qkt_tt = compute_attention_with_cache_and_current(kv_k, kv_v, qr, kr, v, attn_mask)
+            print("")
+            print("Attn test : Single example")
+            compare_torch_tt(qkt_tt, ref_out, device)
 
-        # Check RoPE : Inputs
-        print("")
-        print("RoPE inputs / QKV out")
-        rope_inputs_q_tt_model = tt_intermediates["q_proj"]
-        rope_inputs_k_tt_model = tt_intermediates["k_proj"]
-        rope_inputs_q_tt_model = ttnn.to_torch(ttnn.from_device(rope_inputs_q_tt_model)).to(torch.bfloat16)
-        rope_inputs_k_tt_model = ttnn.to_torch(ttnn.from_device(rope_inputs_k_tt_model)).to(torch.bfloat16)
+        if MODEL_FORWARD:
+            # Forward pass
+            output, tt_intermediates = attention_block.forward(
+                input_tokens=hidden_states, position_indices=position_ids, attention_mask=attention_mask
+            )
+            print("")
+            print(f"First forward pass output: {output.shape}")
+            # Forward pass
 
-        rope_inputs_q_reference = example["outputs/intermediates"]["q_pre_rope"]
-        rope_inputs_k_reference = example["outputs/intermediates"]["k_pre_rope"]
+            atol = 1e-04
+            rtol = 1e-02
 
-        errors_q = torch.abs((rope_inputs_q_tt_model - rope_inputs_q_reference))
-        mean_error_q = torch.mean(errors_q)
-        max_error_q = torch.max(errors_q)
-        print("Q errors        : ", mean_error_q, max_error_q)
-        print("Pcc (Q) : ", pcc(rope_inputs_q_tt_model, rope_inputs_q_reference))
-        # print(rope_inputs_q_tt_model.dtype, rope_inputs_q_reference.dtype)
-        print(
-            "All close check : ",
-            torch.allclose(rope_inputs_q_tt_model, rope_inputs_q_reference, atol=1e-04, rtol=1e-02),
-        )
-        errors_k = torch.abs((rope_inputs_k_tt_model - rope_inputs_k_reference))
-        mean_error_k = torch.mean(errors_k)
-        max_error_k = torch.max(errors_k)
-        print("K errors        : ", mean_error_k, max_error_k)
-        print("Pcc (K) : ", pcc(rope_inputs_k_tt_model, rope_inputs_k_reference))
-        print(
-            "All close check : ",
-            torch.allclose(rope_inputs_k_tt_model, rope_inputs_k_reference, atol=1e-04, rtol=1e-02),
-        )
-        # Check RoPE : Inputs
+            # Check RoPE : Inputs
+            print("")
+            print("RoPE inputs / QKV out")
+            rope_inputs_q_tt_model = tt_intermediates["q_proj"]
+            rope_inputs_k_tt_model = tt_intermediates["k_proj"]
+            rope_inputs_q_tt_model = ttnn.to_torch(ttnn.from_device(rope_inputs_q_tt_model)).to(torch.bfloat16)
+            rope_inputs_k_tt_model = ttnn.to_torch(ttnn.from_device(rope_inputs_k_tt_model)).to(torch.bfloat16)
 
-        # Check RoPE : Outputs
-        print("")
-        print("RoPE outputs")
-        rope_outputs_q_tt_model = tt_intermediates["q_post_rope"]
-        rope_outputs_k_tt_model = tt_intermediates["k_post_rope"]
-        rope_outputs_q_reference = example["outputs/intermediates"]["q_post_rope"]
-        rope_outputs_k_reference = example["outputs/intermediates"]["k_post_rope"]
-        # print("Shape check : q : ", rope_outputs_q_tt_model.shape, rope_outputs_q_reference.shape)
-        # print("Shape check : k : ", rope_outputs_k_tt_model.shape, rope_outputs_k_reference.shape)
-        rope_outputs_q_tt_model = ttnn.to_torch(ttnn.from_device(rope_outputs_q_tt_model)).to(torch.bfloat16)
-        rope_outputs_k_tt_model = ttnn.to_torch(ttnn.from_device(rope_outputs_k_tt_model)).to(torch.bfloat16)
-        errors_q = torch.abs((rope_outputs_q_tt_model - rope_outputs_q_reference))
-        mean_error_q = torch.mean(errors_q)
-        max_error_q = torch.max(errors_q)
-        print("Q errors        : ", mean_error_q, max_error_q)
-        print("Pcc (Q) : ", pcc(rope_outputs_q_tt_model, rope_outputs_q_reference))
-        print(
-            "All close check : ",
-            torch.allclose(rope_outputs_q_tt_model, rope_outputs_q_reference, atol=1e-04, rtol=1e-02),
-        )
+            rope_inputs_q_reference = example["outputs/intermediates"]["q_pre_rope"]
+            rope_inputs_k_reference = example["outputs/intermediates"]["k_pre_rope"]
 
-        errors_k = torch.abs((rope_outputs_k_tt_model - rope_outputs_k_reference))
-        mean_error_k = torch.mean(errors_k)
-        max_error_k = torch.max(errors_k)
-        print("K errors        : ", mean_error_k, max_error_k)
-        print("Pcc (K) : ", pcc(rope_inputs_k_tt_model, rope_inputs_k_reference))
-        print(
-            "All close check : ",
-            torch.allclose(rope_outputs_q_tt_model, rope_outputs_q_reference, atol=1e-04, rtol=1e-02),
-        )
-        # Check RoPE : Outputs
+            errors_q = torch.abs((rope_inputs_q_tt_model - rope_inputs_q_reference))
+            mean_error_q = torch.mean(errors_q)
+            max_error_q = torch.max(errors_q)
+            print("Q errors        : ", mean_error_q, max_error_q)
+            print("Pcc (Q) : ", pcc(rope_inputs_q_tt_model, rope_inputs_q_reference))
+            # print(rope_inputs_q_tt_model.dtype, rope_inputs_q_reference.dtype)
+            print(
+                "All close check : ",
+                torch.allclose(rope_inputs_q_tt_model, rope_inputs_q_reference, atol=1e-04, rtol=1e-02),
+            )
+            errors_k = torch.abs((rope_inputs_k_tt_model - rope_inputs_k_reference))
+            mean_error_k = torch.mean(errors_k)
+            max_error_k = torch.max(errors_k)
+            print("K errors        : ", mean_error_k, max_error_k)
+            print("Pcc (K) : ", pcc(rope_inputs_k_tt_model, rope_inputs_k_reference))
+            print(
+                "All close check : ",
+                torch.allclose(rope_inputs_k_tt_model, rope_inputs_k_reference, atol=1e-04, rtol=1e-02),
+            )
+            # Check RoPE : Inputs
 
-        # Check KV cache
-        print("")
-        print("KV cache")
-        kv_filled_len = tt_intermediates["kv_len_pre_attention"]
-        tt_k_past = ttnn.to_torch(ttnn.from_device(tt_intermediates["K_cache_pre_attention"])).to(torch.bfloat16)[
-            :, :, 0:kv_filled_len, :
-        ]
-        tt_k_past = ttnn.to_torch(ttnn.from_device(tt_intermediates["K_cache_pre_attention"])).to(torch.bfloat16)[
-            :, :, 0:kv_filled_len, :
-        ]
-        k_past_reference = torch.cat(
-            [example["outputs/intermediates"]["K_past"], example["outputs/intermediates"]["k_post_rope"]], dim=2
-        )
-        v_past_reference = torch.cat(
-            [example["outputs/intermediates"]["V_past"], example["outputs/intermediates"]["v_pre_rope"]], dim=2
-        )
-        # k_past_reference= k_past_reference.repeat(1,4,1,1)
-        # v_past_reference= v_past_reference.repeat(1,4,1,1)
-        print(k_past_reference.shape, tt_k_past.shape)
-        errors_k = torch.abs((tt_k_past - k_past_reference))
-        mean_error_k = torch.mean(errors_k)
-        max_error_k = torch.max(errors_k)
-        print("K errors        : ", mean_error_k, max_error_k)
-        print("Pcc (K) : ", pcc(tt_k_past, k_past_reference))
-        print(
-            "All close check : ",
-            torch.allclose(tt_k_past, k_past_reference, atol=1e-04, rtol=1e-02),
-        )
-        # Check KV cache
+            # Check RoPE : Outputs
+            print("")
+            print("RoPE outputs")
+            rope_outputs_q_tt_model = tt_intermediates["q_post_rope"]
+            rope_outputs_k_tt_model = tt_intermediates["k_post_rope"]
+            rope_outputs_q_reference = example["outputs/intermediates"]["q_post_rope"]
+            rope_outputs_k_reference = example["outputs/intermediates"]["k_post_rope"]
+            rope_outputs_q_tt_model = ttnn.to_torch(ttnn.from_device(rope_outputs_q_tt_model)).to(torch.bfloat16)
+            rope_outputs_k_tt_model = ttnn.to_torch(ttnn.from_device(rope_outputs_k_tt_model)).to(torch.bfloat16)
+            errors_q = torch.abs((rope_outputs_q_tt_model - rope_outputs_q_reference))
+            mean_error_q = torch.mean(errors_q)
+            max_error_q = torch.max(errors_q)
+            print("Q errors        : ", mean_error_q, max_error_q)
+            print("Pcc (Q) : ", pcc(rope_outputs_q_tt_model, rope_outputs_q_reference))
+            print(
+                "All close check : ",
+                torch.allclose(rope_outputs_q_tt_model, rope_outputs_q_reference, atol=1e-04, rtol=1e-02),
+            )
 
-        # Get reference output
-        print("")
-        print("Output check.")
-        torch_output = example["outputs/ref_output"]
-        tt_output = ttnn.to_torch(ttnn.from_device(output)).to(dtype=torch.bfloat16)
-        errors = torch.abs((torch_output - tt_output))
-        mean_error = torch.mean(errors)
-        max_error = torch.max(errors)
-        print(
-            "torch allclose (atol 1e-04, rtol 1e-02) output : ",
-            torch.allclose(torch_output, tt_output, atol=1e-04, rtol=1e-02),
-        )
-        print("Mean and Max L1 errors : ", mean_error, max_error)
+            errors_k = torch.abs((rope_outputs_k_tt_model - rope_outputs_k_reference))
+            mean_error_k = torch.mean(errors_k)
+            max_error_k = torch.max(errors_k)
+            print("K errors        : ", mean_error_k, max_error_k)
+            print("Pcc (K) : ", pcc(rope_inputs_k_tt_model, rope_inputs_k_reference))
+            print(
+                "All close check : ",
+                torch.allclose(rope_outputs_q_tt_model, rope_outputs_q_reference, atol=1e-04, rtol=1e-02),
+            )
+            # Check RoPE : Outputs
 
-        mask = torch.abs(torch_output - tt_output) > (atol + rtol * torch.abs(tt_output))
-        # fraction (or %) of elements failing the criterion
-        fail_fraction = mask.float().mean().item()
-        fail_percent = fail_fraction * 100
-        print("Fail percent : ", fail_percent)
-        print("Pcc (q) : ", pcc(torch_output, tt_output))
-        # Get reference output
+            # Check stuff added to secondary KV cache. Initial KV cache has been verified.
+            """
+            print("")
+            print("KV cache")
+            kv_filled_len = tt_intermediates["kv_len_pre_attention"]
+            tt_k_past = ttnn.to_torch(ttnn.from_device(tt_intermediates["K_cache_pre_attention"])).to(torch.bfloat16)[
+                :, :, 0:kv_filled_len, :
+            ]
+            tt_k_past = ttnn.to_torch(ttnn.from_device(tt_intermediates["K_cache_pre_attention"])).to(torch.bfloat16)[
+                :, :, 0:kv_filled_len, :
+            ]
+            k_past_reference = torch.cat(
+                [example["outputs/intermediates"]["K_past"], example["outputs/intermediates"]["k_post_rope"]], dim=2
+            )
+            v_past_reference = torch.cat(
+                [example["outputs/intermediates"]["V_past"], example["outputs/intermediates"]["v_pre_rope"]], dim=2
+            )
+            # k_past_reference= k_past_reference.repeat(1,4,1,1)
+            # v_past_reference= v_past_reference.repeat(1,4,1,1)
+            print(k_past_reference.shape, tt_k_past.shape)
+            errors_k = torch.abs((tt_k_past - k_past_reference))
+            mean_error_k = torch.mean(errors_k)
+            max_error_k = torch.max(errors_k)
+            print("K errors        : ", mean_error_k, max_error_k)
+            print("Pcc (K) : ", pcc(tt_k_past, k_past_reference))
+            print(
+                "All close check : ",
+                torch.allclose(tt_k_past, k_past_reference, atol=1e-04, rtol=1e-02),
+            )
+            """
+            # Check stuff added to secondary KV cache. Initial KV cache has been verified.
 
-        # Check KV cache state
-        kv_state = attention_block.get_kv_cache_state()
-        print(f"KV cache state: {kv_state}")
-        # Check KV cache state
+            # Attention weights
+            print("")
+            print("Attention weights")
+            tt_attn_weights_post_scaling = tt_intermediates["attention_intermediates"]["qkt"]
+            ref_attn_weights_post_scaling = example["outputs/intermediates"]["attn_weights_scale_applied"]
+            tt_attn_weights_post_scaling = ttnn.to_torch(ttnn.from_device(tt_attn_weights_post_scaling)).to(
+                torch.bfloat16
+            )
+            print("Shape of attn weights : ", tt_attn_weights_post_scaling.shape)
 
-        # Cleanup
-        attention_block.cleanup()
+            current_seq_len = tt_attn_weights_post_scaling.shape[2]
+            total_length = tt_attn_weights_post_scaling.shape[3]
+
+            print("Attn dot products : Q - Prefix")
+            tt_attn_weights_post_scaling_prefix = tt_attn_weights_post_scaling[
+                :, :, :, 0 : total_length - current_seq_len
+            ]
+            ref_attn_weights_post_scaling_prefix = ref_attn_weights_post_scaling[
+                :, :, :, 0 : total_length - current_seq_len
+            ]
+            errors = torch.abs((tt_attn_weights_post_scaling_prefix - ref_attn_weights_post_scaling_prefix))
+            mean_error, max_error = torch.mean(errors), torch.max(errors)
+            print("Mean and max errors : ", mean_error, max_error)
+            mask = torch.isclose(tt_attn_weights_post_scaling_prefix, ref_attn_weights_post_scaling_prefix)
+            fail_fraction = mask.float().mean().item()
+            fail_percent = fail_fraction * 100
+            print("Fail percent : ", fail_percent)
+            print("Pcc  : ", pcc(tt_attn_weights_post_scaling_prefix, ref_attn_weights_post_scaling_prefix))
+
+            print("Attn dot products : Q - current")
+            tt_attn_weights_post_scaling_current = tt_attn_weights_post_scaling[
+                :, :, :, total_length - current_seq_len :
+            ]
+            ref_attn_weights_post_scaling_current = ref_attn_weights_post_scaling[
+                :, :, :, total_length - current_seq_len :
+            ]
+            errors = torch.abs((tt_attn_weights_post_scaling_current - ref_attn_weights_post_scaling_current))
+            mean_error, max_error = torch.mean(errors), torch.max(errors)
+            print("Mean and max errors : ", mean_error, max_error)
+            mask = torch.isclose(tt_attn_weights_post_scaling_current, ref_attn_weights_post_scaling_current)
+            fail_fraction = mask.float().mean().item()
+            fail_percent = fail_fraction * 100
+            print("Fail percent : ", fail_percent)
+            print("Pcc  : ", pcc(tt_attn_weights_post_scaling_current, ref_attn_weights_post_scaling_current))
+            # Attention weights
+
+            # Get reference output
+            print("")
+            print("Output check.")
+            torch_output = example["outputs/ref_output"]
+            tt_output = ttnn.to_torch(ttnn.from_device(output)).to(dtype=torch.bfloat16)
+            errors = torch.abs((torch_output - tt_output))
+            mean_error = torch.mean(errors)
+            max_error = torch.max(errors)
+            print(
+                "torch allclose (atol 1e-04, rtol 1e-02) output : ",
+                torch.allclose(torch_output, tt_output, atol=1e-04, rtol=1e-02),
+            )
+            print("Mean and Max L1 errors : ", mean_error, max_error)
+            mask = torch.abs(torch_output - tt_output) > (atol + rtol * torch.abs(tt_output))
+            # fraction (or %) of elements failing the criterion
+            fail_fraction = mask.float().mean().item()
+            fail_percent = fail_fraction * 100
+            print("Fail percent : ", fail_percent)
+            print("Pcc (q) : ", pcc(torch_output, tt_output))
+            # Get reference output
+
+            # Check KV cache state
+            kv_state = attention_block.get_kv_cache_state()
+            print(f"KV cache state: {kv_state}")
+            # Check KV cache state
+
+            # Cleanup
+            attention_block.cleanup()
 
     finally:
         print("Closing device")
