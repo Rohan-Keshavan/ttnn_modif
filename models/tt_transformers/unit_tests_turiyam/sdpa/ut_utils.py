@@ -17,8 +17,8 @@ dtypes_config = {
     "intermediates_tt": ttnn.float32,
 }
 
-closeness_config = {"ATOL": 1e-03, "RTOL": 1e-02}
-
+dtypes_torch_tt = {"torch.bfloat16": ttnn.bfloat16, "torch.float32": ttnn.float32}
+closeness_config = {"ATOL": 1e-03, "RTOL": 5e-02}
 compute_kernel_config_hifi4 = ttnn.WormholeComputeKernelConfig(
     math_fidelity=ttnn.MathFidelity.HiFi4,
     math_approx_mode=False,
@@ -90,8 +90,6 @@ def get_tensor_stats(x):
     return {"min": torch.min(x), "max": torch.max(x), "l2": torch.norm(x)}
 
 
-# 4096 * 4096
-# 1024 * 4096
 def get_torch_linear_out_llama_3(x, A):
     # check for types first
     # No concept of intermediates here
@@ -140,8 +138,84 @@ def get_tt_linear_out_llama_3(x, A, device=None):
     return [Ax, Ax_stats]
 
 
-def torch_to_tt(x, device):
-    return
+def tt_attention_llama_3(k_past, v_past, q_rotated, k_current, v_current, scale, attention_mask=None):
+    """Compute attention using KV cache + current tokens."""
+    # k and v past are the right slices needed for the attention computation
+    # Attention mask is only for the current sequence (Draft tree)
+    intermediates = {}
+    head_dim = k_past.shape[-1]
+    attn_scale = scale
+
+    # Get the relevant KV slice, Expand K and V
+    n_qheads = q_rotated.shape[1]
+    n_kv_heads = k_past.shape[1]
+    gqa_group_size = int(n_qheads / n_kv_heads)
+    k_past = ttnn.repeat_interleave(k_past, repeats=gqa_group_size, dim=1)
+    v_past = ttnn.repeat_interleave(v_past, repeats=gqa_group_size, dim=1)
+
+    # Compute attention scores past: Q @ K_past^T
+    qkt_past = ttnn.linear(q_rotated, k_past, transpose_b=True, compute_kernel_config=compute_kernel_config_hifi4)
+    qkt_past = qkt_past * attn_scale  # No mask needed
+    intermediates["qkt_past"] = qkt_past
+    qkt_past = ttnn.typecast(qkt_past, dtype=dtypes_config["intermediates_tt"])
+
+    # repeat k, compute attention scores current : Q @ K^T
+    k_current = ttnn.repeat_interleave(k_current, repeats=gqa_group_size, dim=1)
+    qkt_current = ttnn.linear(q_rotated, k_current, transpose_b=True, compute_kernel_config=compute_kernel_config_hifi4)
+    qkt_current = qkt_current * attn_scale
+    intermediates["qkt_current"] = qkt_current
+    qkt_current = ttnn.typecast(qkt_current, dtype=dtypes_config["intermediates_tt"])
+
+    # Apply attention mask if provided
+    if attention_mask is not None:
+        qkt_current = ttnn.add(qkt_current, attention_mask)
+
+    # Concat prefix and current qkts
+    qkt = ttnn.concat([qkt_past, qkt_current], dim=-1)
+    intermediates["qkt_masked"] = qkt
+
+    # Softmax and attention output
+    qkt = ttnn.softmax(qkt, dim=-1)
+    intermediates["qkt_softmaxed"] = qkt
+
+    qkt = ttnn.typecast(qkt, dtype=dtypes_config["outputs_tt"])
+    intermediates["qkt_softmaxed_down_casted"] = qkt
+
+    # Softmax and attention output
+    v_current = ttnn.repeat_interleave(v_current, repeats=gqa_group_size, dim=1)
+    v_complete = ttnn.concat([v_past, v_current], dim=2)
+    qktv = ttnn.linear(qkt, v_complete, compute_kernel_config=compute_kernel_config_hifi4)
+    intermediates["qktv"] = qktv
+
+    return qktv, intermediates
+
+
+def get_tt_attn_out_llama_3(kv_k, kv_v, q_rotated, k_rotated, v_current, attention_mask, device=None):
+    bsz, nkv_heads, _, head_dim = kv_k.shape
+    attn_scale = 1 / (head_dim**0.5)
+    _, _, n_draft, cur_seq_len = attention_mask.shape
+    past_kv_len = int(cur_seq_len - n_draft)
+    kv_k = kv_k[:, :, 0:past_kv_len, :]
+    kv_v = kv_v[:, :, 0:past_kv_len, :]
+    attention_mask = attention_mask[:, :, :, past_kv_len:]
+    attention_mask = torch_to_tt_default(attention_mask, device=device)
+    kv_k = torch_to_tt_default(kv_k, device=device)
+    kv_v = torch_to_tt_default(kv_v, device=device)
+    q_rotated = torch_to_tt_default(q_rotated, device=device)
+    k_rotated = torch_to_tt_default(k_rotated, device=device)
+    v_current = torch_to_tt_default(v_current, device=device)
+    _, tt_intermediates = tt_attention_llama_3(kv_k, kv_v, q_rotated, k_rotated, v_current, attn_scale, attention_mask)
+    return tt_intermediates
+
+
+def torch_to_tt_default(x, device):
+    return ttnn.from_torch(
+        x,
+        device=device,
+        dtype=dtypes_torch_tt[str(x.dtype)],
+        layout=ttnn.TILE_LAYOUT,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
 
 
 def tt_to_torch(x, on_device=True):

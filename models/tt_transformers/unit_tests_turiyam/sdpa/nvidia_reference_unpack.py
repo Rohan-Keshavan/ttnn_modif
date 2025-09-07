@@ -11,18 +11,16 @@ def load_pt_gz(file_path):
         print("")
         print("Loaded data type : ", type(data))
         if isinstance(data, dict):
-            print("Load loaded a dict. Keys -> Shapes -> Types")
+            print("Load loaded a dict.")
     return data
 
 
 def get_qkvo_reference(data):
     qkvo_reference = {}
     qkvo_reference["qkv_in"] = data["layer_in"]
-
     qkvo_reference["o_in"] = data["attn_out_vproj"]
     bsz, nheads, seq_len, head_dim = qkvo_reference["o_in"].shape
     qkvo_reference["o_in"] = qkvo_reference["o_in"].permute(0, 2, 1, 3).reshape(bsz, seq_len, nheads * head_dim)
-
     qkvo_reference["qkv_q_out"] = data["qkv_q"]
     qkvo_reference["qkv_k_out"] = data["qkv_k"]
     qkvo_reference["qkv_v_out"] = data["qkv_v"]
@@ -32,6 +30,7 @@ def get_qkvo_reference(data):
 
 def get_rope_reference(data):
     rope_reference = {}
+    rope_reference["pos_ids"] = data["position_ids"]
     rope_reference["q_in"] = data["qkv_q"]
     rope_reference["k_in"] = data["qkv_k"]
     rope_reference["cos"] = data["cos"]
@@ -43,23 +42,26 @@ def get_rope_reference(data):
 
 def get_attn_reference(data):
     attn_reference = {}
-    attn_reference["q_rotated"] = data["q_rotated"]
-    attn_reference["k_rotated"] = data["k_rotated"]
-    attn_reference["v"] = data["qkv_v"]
-    attn_reference["mask"] = data["attention_mask"]
-
-    attn_reference["qkt_scaled"] = data["attn_weights"]
-    attn_reference["qkt_scaled_masked"] = data["attn_weights_masked"]
-    attn_reference["qkt_scaled_masked_softmaxed"] = data["attn_weights_softmaxed"]
-    attn_reference["qkt_scaled_masked_softmaxed_downcasted"] = data["attn_weights_softmaxed_downcasted"]
-    attn_reference["`qkt_v_proj"] = data["attn_out_vproj"]
+    attn_reference["k_cache"] = data["past_kv_k"]  # bf16
+    attn_reference["v_cache"] = data["past_kv_v"]  # bf16
+    attn_reference["q_rotated"] = data["roped_q"]  # bf16
+    attn_reference["k_rotated"] = data["roped_k"]  # bf16
+    attn_reference["v"] = data["qkv_v"]  # bf16
+    attn_reference["mask"] = data["attention_mask"]  # f32
+    attn_reference["qkt_scaled"] = data["attn_weights"]  # bf16 -> f32
+    attn_reference["qkt_scaled_masked"] = data["attn_weights_masked"]  # f32
+    attn_reference["qkt_scaled_masked_softmaxed"] = data["attn_weights_softmaxed"]  # f32
+    attn_reference["qkt_scaled_masked_softmaxed_downcasted"] = data["attn_weights_softmaxed_down_casted"]  # bf16
+    attn_reference["qkt_v_proj"] = data["attn_out_vproj"]  # bf16
 
     return attn_reference
 
 
-def attn_block_reference(data):
+def get_attn_block_reference(data):
     attn_block_reference = {}
     attn_block_reference["inputs"] = data["layer_in"]
+    attn_reference["k_cache"] = data["past_kv_k"]
+    attn_reference["v_cache"] = data["past_kv_v"]
     attn_block_reference["outputs"] = data["layer_out"]
     return attn_block_reference
 
@@ -77,6 +79,7 @@ if __name__ == "__main__":
 
     layer_0_weights = load_attn_weights_llama_3()
     qkvo_reference = get_qkvo_reference(x)
+    attn_reference = get_attn_reference(x)
 
     # Qx
     print("")
@@ -107,5 +110,30 @@ if __name__ == "__main__":
     compare(Ox, Ox_tt)
 
     # Attention
+    print("")
+    print("Attention")
+    print("")
+    print("At Attn weights")
+    tt_intermediates = get_tt_attn_out_llama_3(
+        attn_reference["k_cache"],
+        attn_reference["v_cache"],
+        attn_reference["q_rotated"],
+        attn_reference["k_rotated"],
+        attn_reference["v"],
+        attn_reference["mask"],
+        device,
+    )
+    tt_qkt_past = (tt_to_torch(tt_intermediates["qkt_past"], on_device=True)).to(dtypes_config["outputs_torch"])
+    tt_qkt_current = (tt_to_torch(tt_intermediates["qkt_current"], on_device=True)).to(dtypes_config["outputs_torch"])
+    tt_attn_weights = torch.cat([tt_qkt_past, tt_qkt_current], dim=-1)
+    compare(tt_attn_weights, attn_reference["qkt_scaled"])
+    print("")
+    print("At Attn scaling  + softmax (fp32)")
+    tt_qkt_softmaxed = tt_to_torch(tt_intermediates["qkt_softmaxed"], on_device=True)
+    compare(tt_qkt_softmaxed, attn_reference["qkt_scaled_masked_softmaxed"])
+    print("")
+    print("At qktv")
+    tt_qktv = tt_to_torch(tt_intermediates["qktv"], on_device=True).to(dtypes_config["outputs_torch"])
+    compare(tt_qktv, attn_reference["qkt_v_proj"])
 
     # RoPE

@@ -899,8 +899,8 @@ class AttentionBlock:
         # Get the relevant KV slice, Expand K and V
         K_filled = ttnn.slice(self.K_past, (0, 0, 0, 0), (self.BATCH_SIZE, self.N_KVHEADS, self.kv_len, self.HEAD_DIM))
         V_filled = ttnn.slice(self.V_past, (0, 0, 0, 0), (self.BATCH_SIZE, self.N_KVHEADS, self.kv_len, self.HEAD_DIM))
-        K_filled = ttnn.repeat(K_filled, [1, self.GQA_GROUP_SIZE, 1, 1])
-        V_filled = ttnn.repeat(V_filled, [1, self.GQA_GROUP_SIZE, 1, 1])
+        K_filled = ttnn.repeat_interleave(K_filled, repeats=self.GQA_GROUP_SIZE, dim=1)
+        V_filled = ttnn.repeat_interleave(V_filled, repeats=self.GQA_GROUP_SIZE, dim=1)
         print(f"Using filled KV cache: {K_filled.shape}, {V_filled.shape} (filled: {self.kv_len}/{self.max_capacity})")
         # Get the relevant KV slice, Expand K and V
 
@@ -912,7 +912,7 @@ class AttentionBlock:
         attention_intermediates["qkt_past"] = qkt_past
 
         # repeat and permute k
-        k_current = ttnn.repeat(k_current, [1, self.GQA_GROUP_SIZE, 1, 1])
+        k_current = ttnn.repeat_interleave(k_current, repeats=self.GQA_GROUP_SIZE, dim=1)
         qkt_current = ttnn.linear(
             q_rotated, k_current, transpose_b=True, compute_kernel_config=self.compute_kernel_config_hifi4
         )
@@ -942,7 +942,7 @@ class AttentionBlock:
         print("Overall qkt and v shape : ", qkt.shape, v_current.shape, V_filled.shape)
         # Softmax and attention output
 
-        v_current = ttnn.repeat(v_current, [1, self.GQA_GROUP_SIZE, 1, 1])
+        v_current = ttnn.repeat_interleave(v_current, repeats=self.GQA_GROUP_SIZE, dim=1)
         v_complete = ttnn.concat([V_filled, v_current], dim=2)
 
         attn_out = ttnn.linear(qkt, v_complete)  # [batch, heads, seq_len, head_dim] #v mul can also be split
@@ -1401,7 +1401,7 @@ def compare_torch_tt(x_tt, x_torch, device):
 if __name__ == "__main__":
     # Load reference example
     root = os.getcwd()
-    ref_data_path = os.path.join(root, "reference_data")
+    ref_data_path = os.path.join(root, "reference_data_tt_cpu")
     example = torch.load(os.path.join(ref_data_path, "example_with_intermediates.pt"))
     # Load reference example
 
