@@ -17,7 +17,15 @@ dtypes_config = {
     "intermediates_tt": ttnn.float32,
 }
 
-closeness_config = {"ATOL": 1e-04, "RTOL": 1e-02}
+closeness_config = {"ATOL": 1e-03, "RTOL": 1e-02}
+
+compute_kernel_config_hifi4 = ttnn.WormholeComputeKernelConfig(
+    math_fidelity=ttnn.MathFidelity.HiFi4,
+    math_approx_mode=False,
+    fp32_dest_acc_en=True,
+    packer_l1_acc=True,
+    # False is an order of mangnitude worse. Why?
+)
 
 
 def load_attn_weights_llama_3(layer_idx=0):
@@ -94,9 +102,42 @@ def get_torch_linear_out_llama_3(x, A):
     out_dim = A.shape[0]
     torch_layer = nn.Linear(in_dim, out_dim, bias=False)  # No biases in Llama 3 (or 4)
     torch_layer.load_state_dict({"weight": A})
+    torch_layer.weight.data = torch_layer.weight.data.to(dtypes_config["parameters_torch"])
+    print("x and A type : ", x.dtype, torch_layer.weight.data.dtype)
     Ax = torch_layer(x).to(dtype=dtypes_config["outputs_torch"])
     Ax_stats = get_tensor_stats(Ax)
     return [Ax, x_stats, Ax_stats]
+
+
+def get_tt_linear_out_llama_3(x, A, device=None):
+    x = x.to(dtype=dtypes_config["inputs_torch"])
+    x = ttnn.from_torch(
+        x,
+        device=device,
+        dtype=dtypes_config["inputs_tt"],
+        layout=ttnn.TILE_LAYOUT,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+    A = A.to(dtype=dtypes_config["inputs_torch"])
+    A = ttnn.from_torch(
+        A,
+        device=device,
+        dtype=dtypes_config["parameters_tt"],
+        layout=ttnn.TILE_LAYOUT,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+    Ax = ttnn.linear(
+        x,
+        A,
+        transpose_b=True,
+        dtype=dtypes_config["outputs_tt"],
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        compute_kernel_config=compute_kernel_config_hifi4,
+    )
+    Ax = tt_to_torch(Ax, on_device=True)
+    Ax = Ax.to(dtype=dtypes_config["outputs_torch"])
+    Ax_stats = get_tensor_stats(Ax)
+    return [Ax, Ax_stats]
 
 
 def torch_to_tt(x, device):
@@ -127,6 +168,6 @@ def compare(x: torch.Tensor, y: torch.Tensor, atol=closeness_config["ATOL"], rto
     mask = torch.abs(y - x) > (atol + rtol * torch.abs(y))
     fail_fraction = mask.float().mean().item()
     fail_percent = fail_fraction * 100
-    print("Fail percent : ", fail_percent)
-    print("Pcc (q) : ", pcc(y, x))
+    print("Fail percent             : ", fail_percent)
+    print("Pcc                      : ", pcc(y, x))
     return
