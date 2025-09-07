@@ -71,7 +71,7 @@ def load_reference_inputs():
     root = os.getcwd()
     ref_data_path = os.path.join(root, "reference_data")
     example = torch.load(os.path.join(ref_data_path, "example_with_intermediates.pt"))
-    ref_inputs = example["args/hidden_states"]
+    ref_inputs = example["args/hidden_states_post_norm"]
     print("Reference data loaded")
     return example, ref_inputs
 
@@ -323,7 +323,7 @@ if __name__ == "__main__":
     tt_output_v_torch = ttnn.to_torch(ttnn.from_device(tt_output_v))
     print("TT v output computed. Copied to cpu as torch.")
 
-    atol = 1e-03
+    atol = 1e-04
     rtol = 1e-02  # sweep to get zero error threshold
 
     error_pointwise = torch.abs((torch_output_q - tt_output_q_torch))

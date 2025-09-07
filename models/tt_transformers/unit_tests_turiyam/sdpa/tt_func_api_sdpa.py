@@ -249,10 +249,10 @@ class AttentionBlock:
         self.N_KVHEADS = 8  # Default for LLaMA 8B (GQA)
         self.HEAD_DIM = 128  # Default: 4096 // 32
         self.GQA_GROUP_SIZE = int(self.N_QHEADS / self.N_KVHEADS)
-        # self.KV_MAX_CHUNK_SIZE = 32
 
         # TT-Metal settings
         self.TILE_SIZE = 32
+        # self.MAX_KV_CHUNK_SIZE = 32
         self.BATCH_SIZE = 1
         self.MAX_BATCH_SIZE = 1
         self.MAX_SEQ_LEN = 1024
@@ -282,13 +282,15 @@ class AttentionBlock:
         self.rope_cpu = False
         if model_path:
             self.load_weights(model_path, layer_idx)
-
         # Setup RoPE
         if self.hf_config_file is not None:
             self.setup_rope_cpu()
 
         self.compute_kernel_config_hifi4 = ttnn.WormholeComputeKernelConfig(
-            math_fidelity=ttnn.MathFidelity.HiFi4, math_approx_mode=False, fp32_dest_acc_en=True, packer_l1_acc=True
+            math_fidelity=ttnn.MathFidelity.HiFi4,
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=True,
         )
 
         # Initialize KV cache
@@ -425,7 +427,6 @@ class AttentionBlock:
                     memory_config=ttnn.DRAM_MEMORY_CONFIG,
                 )
 
-                print("Weights before transposing (qkvo) : ", self.Q.shape, self.K.shape, self.V.shape, self.O.shape)
                 self.Q = ttnn.permute(self.Q, (1, 0))
                 self.K = ttnn.permute(self.K, (1, 0))
                 self.V = ttnn.permute(self.V, (1, 0))
@@ -529,7 +530,7 @@ class AttentionBlock:
 
         intermediates = {}
         print("")
-        print(f"Forward pass: {input_tokens.shape}")
+        print(f"Forward pass [Inputs]: {input_tokens.shape}")
         intermediates["inputs"] = input_tokens
 
         # Step 1: QKV Projection
@@ -549,18 +550,11 @@ class AttentionBlock:
             intermediates["k_post_rope"] = k_rotated
             intermediates["q_post_rope"] = q_rotated
 
-        # Step 3 : Head broadcast, K and V : Can keep cache smaller, optimize for later
-        # k_rotated                           = ttnn.repeat(k_rotated , [1, self.GQA_GROUP_SIZE, 1, 1])
-        # v_proj                              = ttnn.repeat(v_proj    , [1, self.GQA_GROUP_SIZE, 1, 1])
-        # Head broadcast,         K and V : Can keep cache smaller, optimize for later
-
-        # Step 4: Update KV cache : Skip the update ? Makes more sense actually. Update post verification.
-        # self._update_kv_cache(k_rotated, v_proj)
-        # print(f"KV updated. Current cache length: {self.kv_len}")
+        # Step 4: Update KV cache : Skip the update now. Update post verification.
         intermediates["K_cache_pre_attention"] = self.K_past
         intermediates["V_cache_pre_attention"] = self.V_past
         intermediates["kv_len_pre_attention"] = self.kv_len
-        # Step 4: Update KV cache
+        # Step 4: Update KV cache : Skip the update now. Update post verification.
 
         # Step 5: Attention
         attn_out, attention_intermediates = self._compute_attention_with_cache(
@@ -584,9 +578,13 @@ class AttentionBlock:
 
         return output, intermediates
 
+    # Empty
     def _forward_attention():
         return output
 
+    # Empty
+
+    # Not used anymore
     def _expand_gqa_weights(self):
         """Expand K and V weights for GQA."""
         print("GQA Weight Expansion: Expanding K and V weights...")
@@ -617,11 +615,11 @@ class AttentionBlock:
 
         return K_expanded_flat, V_expanded_flat
 
+    # Not used anymore
+
     #    def _project_qkv(self, input_tokens, K_expanded, V_expanded):
     def _project_qkv(self, input_tokens, reshape_and_expand=False):
-        """Project input tokens to Q, K, V."""
         print("QKV Projection...")
-
         q_proj = ttnn.linear(
             input_tokens,
             self.Q,
@@ -629,7 +627,6 @@ class AttentionBlock:
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             compute_kernel_config=self.compute_kernel_config_hifi4,
         )
-        #        k_proj = ttnn.linear(input_tokens, K_expanded,dtype = ttnn.bfloat16,memory_config=ttnn.DRAM_MEMORY_CONFIG,compute_kernel_config=self.compute_kernel_config_hifi4)
         k_proj = ttnn.linear(
             input_tokens,
             self.K,
@@ -637,7 +634,6 @@ class AttentionBlock:
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             compute_kernel_config=self.compute_kernel_config_hifi4,
         )
-        #        v_proj = ttnn.linear(input_tokens, V_expanded,dtype = ttnn.bfloat16,memory_config=ttnn.DRAM_MEMORY_CONFIG,compute_kernel_config=self.compute_kernel_config_hifi4)
         v_proj = ttnn.linear(
             input_tokens,
             self.V,
@@ -653,14 +649,13 @@ class AttentionBlock:
 
             k_proj = ttnn.reshape(k_proj, (k_proj.shape[0], k_proj.shape[1], self.N_KVHEADS, self.HEAD_DIM))
             k_proj = ttnn.permute(k_proj, (0, 2, 1, 3))
-            # k_proj = ttnn.repeat(k_proj, [1, 1, self.GQA_GROUP_SIZE, 1])
 
             v_proj = ttnn.reshape(v_proj, (v_proj.shape[0], v_proj.shape[1], self.N_KVHEADS, self.HEAD_DIM))
             v_proj = ttnn.permute(v_proj, (0, 2, 1, 3))
-            # v_proj = ttnn.repeat(v_proj, [1, 1, self.GQA_GROUP_SIZE, 1])
         print("qkv rope in: ", q_proj.shape, k_proj.shape, v_proj.shape)
         return q_proj, k_proj, v_proj
 
+    # Not used anymore
     def _reshape_to_heads(self, q_proj, k_proj, v_proj):
         """Reshape QKV projections to separate heads."""
         print("Reshaping to heads...")
@@ -678,6 +673,9 @@ class AttentionBlock:
 
         return q_reshaped, k_reshaped, v_reshaped
 
+    # Not used anymore
+
+    # On device RoPE : Issues
     def _apply_rope(self, q_reshaped, k_reshaped, rot_mats=None):
         """Apply RoPE to Q and K."""
         print("Applying RoPE...")
@@ -720,6 +718,8 @@ class AttentionBlock:
         print(f"QK rotated: {q_rotated.shape}, {k_rotated.shape}")
         return q_rotated, k_rotated
 
+    # On device RoPE : Issues
+
     def _apply_rope_cpu(self, q, k, pos_ids):
         q = ttnn.to_torch(ttnn.from_device(q)).to(torch.bfloat16)
         k = ttnn.to_torch(ttnn.from_device(k)).to(torch.bfloat16)
@@ -741,6 +741,7 @@ class AttentionBlock:
         )
         return q_rotated, k_rotated
 
+    # Device RoPE prep
     def _prepare_step_rope(self, position_indices):
         max_position = max(position_indices)
         min_position = min(position_indices)
@@ -759,9 +760,10 @@ class AttentionBlock:
         # Need the full thing
         return [tt_cosines_full, tt_sines_full]
 
+    # Device RoPE prep
+
     def manual_kv_add(self, k_ext, v_ext):  # Torch inputs
-        # k_ext = k_ext.repeat(1, self.GQA_GROUP_SIZE, 1, 1)
-        # v_ext = v_ext.repeat(1, self.GQA_GROUP_SIZE, 1, 1)
+        print("")
         print("Manual KV update....")
         print("k_ext , v_ext : ", k_ext.shape, v_ext.shape)
         print("Chunking and pushing into pre-allocated cache.")
@@ -776,36 +778,6 @@ class AttentionBlock:
             self.V_past, v, batch_idx=0
         )  # might have a max seq len limitation. Unit test this. Or go paged.
         self.kv_len = k.shape[2]
-
-        # Chunk this
-        """
-        n_tokens_in_ext = k_ext.shape[2]
-        n_chunks        = int(n_tokens_in_ext / self.KV_MAX_CHUNK_SIZE)
-        if (n_tokens_in_ext / self.KV_MAX_CHUNK_SIZE) > n_chunks:
-            n_chunks    += 1
-
-        print("Populating KV from ext : chunk size ", self.KV_MAX_CHUNK_SIZE)
-        for j in range(n_chunks):
-            start = int(j * self.KV_MAX_CHUNK_SIZE)
-            end   = int((j + 1) * self.KV_MAX_CHUNK_SIZE)
-            if end > n_tokens_in_ext:
-                end = n_tokens_in_ext
-            k_chunk = k_ext[:, :, start:end, :]
-            v_chunk = v_ext[:, :, start:end, :]
-
-            k_chunk = ttnn.from_torch(k_chunk,device=device,memory_config=ttnn.DRAM_MEMORY_CONFIG,dtype=ttnn.bfloat16,layout=ttnn.TILE_LAYOUT)
-            v_chunk = ttnn.from_torch(v_chunk,device=device,memory_config=ttnn.DRAM_MEMORY_CONFIG,dtype=ttnn.bfloat16,layout=ttnn.TILE_LAYOUT)
-            print("Trying to push : ", k_chunk.shape, v_chunk.shape)
-            if self.kv_len == 0:
-                ttnn.fill_cache(self.K_past, k_chunk, batch_idx=0)
-                ttnn.fill_cache(self.V_past, v_chunk, batch_idx=0)
-            else:
-                ttnn.update_cache(self.K_past, k_chunk, update_idx=self.kv_len, batch_offset=0)
-                ttnn.update_cache(self.V_past, v_chunk, update_idx=self.kv_len, batch_offset=0)
-            self.kv_len += k_chunk.shape[2]
-            print("KV updated... current kv length : ", self.kv_len)
-        """
-        # chunk this
 
         print("Manual KV add complete. Verifying adds..")
 
@@ -850,6 +822,7 @@ class AttentionBlock:
         """
         return self._compute_attention_with_cache_and_current(q_rotated, k_current, v_current, attention_mask)
 
+    # Not used anymore
     def _compute_attention_current_tokens_only(self, q_rotated, k_current, v_current, attention_mask=None):
         """Compute attention using only current tokens (no cache)."""
         print("Computing attention with current tokens only...")
@@ -890,6 +863,8 @@ class AttentionBlock:
 
         print(f"Self-attention output: {attn_out.shape}")
         return attn_out
+
+    # Not used anymore
 
     def _compute_attention_block(self, q, k, v, mask=None):
         # q, k , v are ttnn tensors on device
@@ -1468,16 +1443,8 @@ if __name__ == "__main__":
             layout=ttnn.TILE_LAYOUT,
         )
 
-        # Setup prefix KV cache on tt
-        print("")
-        print("Trying to forward with..")
-        print("Ref inputs E and M   : ", hidden_states.shape, attention_mask.shape)
-        print("Past kv              : ", past_k.shape, past_v.shape)
-        attention_block.manual_kv_add(past_k, past_v)
-        # Setup prefix KV cache on tt
-
-        MODEL_FORWARD = False
-        ATTN_TEST = True
+        MODEL_FORWARD = True
+        ATTN_TEST = False
 
         if ATTN_TEST:
             kv_k, kv_v, qr, kr, v, attn_mask, ref_out = prepare_attention_in(example=example, device=device)
@@ -1487,6 +1454,14 @@ if __name__ == "__main__":
             compare_torch_tt(qkt_tt, ref_out, device)
 
         if MODEL_FORWARD:
+            # Setup prefix KV cache on tt
+            print("")
+            print("Trying to forward with..")
+            print("Ref inputs E and M   : ", hidden_states.shape, attention_mask.shape)
+            print("Past kv              : ", past_k.shape, past_v.shape)
+            attention_block.manual_kv_add(past_k, past_v)
+            # Setup prefix KV cache on tt
+
             # Forward pass
             output, tt_intermediates = attention_block.forward(
                 input_tokens=hidden_states, position_indices=position_ids, attention_mask=attention_mask
