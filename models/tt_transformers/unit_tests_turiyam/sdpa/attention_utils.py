@@ -218,18 +218,6 @@ def generate_random_embeddings_and_mask_torch(batch_size, in_seq_len, model_hidd
 
 
 def generate_random_embeddings(seq_len, model_hidden, batch_size=1, device=None):
-    """
-    Generate random token embeddings for testing.
-
-    Args:
-        seq_len: Sequence length
-        model_hidden: Hidden dimension
-        batch_size: Batch size (default: 1)
-        device: TT-Metal device (optional, for direct TT-Metal tensor creation)
-
-    Returns:
-        torch.Tensor or ttnn.Tensor: Random embeddings
-    """
     embeddings = torch.randn(batch_size, seq_len, model_hidden)
 
     if device is not None:
@@ -247,35 +235,18 @@ def generate_random_embeddings(seq_len, model_hidden, batch_size=1, device=None)
 
 
 def generate_attention_mask(seq_len, batch_size=1, n_heads=1, causal=True, device=None):
-    """
-    Generate attention mask for testing.
-
-    Args:
-        seq_len: Sequence length
-        batch_size: Batch size (default: 1)
-        n_heads: Number of attention heads (default: 1)
-        causal: Whether to generate causal mask (default: True)
-        device: TT-Metal device (optional, for direct TT-Metal tensor creation)
-
-    Returns:
-        torch.Tensor or ttnn.Tensor: Attention mask
-    """
     if causal:
-        # Create causal mask (lower triangular)
         mask = torch.tril(torch.ones(seq_len, seq_len))
     else:
-        # Create full attention mask
         mask = torch.ones(seq_len, seq_len)
 
     # Add batch and head dimensions
     mask = mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, seq_len]
     mask = mask.repeat(batch_size, n_heads, 1, 1)  # [batch_size, n_heads, seq_len, seq_len]
 
-    # Convert to log space and clamp
     mask = torch.clamp(torch.log(mask), min=-1e06)
 
     if device is not None:
-        # Convert to TT-Metal tensor
         mask_tt = ttnn.as_tensor(
             mask, device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT
         )
@@ -285,19 +256,6 @@ def generate_attention_mask(seq_len, batch_size=1, n_heads=1, causal=True, devic
 
 
 def generate_rectangular_attention_mask(current_seq_len, new_seq_len, batch_size=1, n_heads=1, device=None):
-    """
-    Generate rectangular attention mask for Eagle-style speculative decoding.
-
-    Args:
-        current_seq_len: Current sequence length in KV cache
-        new_seq_len: New sequence length being added
-        batch_size: Batch size (default: 1)
-        n_heads: Number of attention heads (default: 1)
-        device: TT-Metal device (optional, for direct TT-Metal tensor creation)
-
-    Returns:
-        torch.Tensor or ttnn.Tensor: Rectangular attention mask
-    """
     # Create prefix mask: new tokens can attend to all previous tokens
     prefix_mask = torch.ones(batch_size, n_heads, new_seq_len, current_seq_len)
 
@@ -325,18 +283,6 @@ def generate_rectangular_attention_mask(current_seq_len, new_seq_len, batch_size
 
 
 def create_position_indices(start_pos, seq_len, allow_duplicates=False, duplicate_pattern=None):
-    """
-    Create position indices for tokens.
-
-    Args:
-        start_pos: Starting position
-        seq_len: Sequence length
-        allow_duplicates: Whether to allow duplicate positions (for Eagle)
-        duplicate_pattern: Pattern for duplicates (e.g., [0, 0, 1, 1, 2] for 5 tokens)
-
-    Returns:
-        list: Position indices
-    """
     if allow_duplicates and duplicate_pattern is not None:
         # Use custom duplicate pattern
         if len(duplicate_pattern) != seq_len:
@@ -356,133 +302,3 @@ def create_position_indices(start_pos, seq_len, allow_duplicates=False, duplicat
     else:
         # Sequential positions (no duplicates)
         return list(range(start_pos, start_pos + seq_len))
-
-
-def validate_model_config(config):
-    """
-    Validate model configuration for GQA compatibility.
-
-    Args:
-        config: Model configuration object
-
-    Returns:
-        bool: True if valid, raises error if not
-    """
-    # Check required attributes
-    required_attrs = ["hidden_size", "num_attention_heads", "num_key_value_heads"]
-    for attr in required_attrs:
-        if not hasattr(config, attr):
-            raise ValueError(f"Config missing required attribute: {attr}")
-
-    # Check GQA compatibility
-    n_qheads = config.num_attention_heads
-    n_kvheads = config.num_key_value_heads
-
-    if n_qheads % n_kvheads != 0:
-        raise ValueError(
-            f"GQA requires num_attention_heads ({n_qheads}) to be divisible by " f"num_key_value_heads ({n_kvheads})"
-        )
-
-    # Check head dimension
-    head_dim = config.hidden_size // n_qheads
-    if head_dim * n_qheads != config.hidden_size:
-        raise ValueError(
-            f"Hidden size ({config.hidden_size}) must be divisible by " f"num_attention_heads ({n_qheads})"
-        )
-
-    print(f"✅ Model config validation passed:")
-    print(f"   - Hidden size: {config.hidden_size}")
-    print(f"   - Query heads: {n_qheads}")
-    print(f"   - KV heads: {n_kvheads}")
-    print(f"   - Head dimension: {head_dim}")
-    print(f"   - GQA group size: {n_qheads // n_kvheads}")
-
-    return True
-
-
-def cleanup_tensors(tensors):
-    """
-    Clean up a list of TT-Metal tensors.
-
-    Args:
-        tensors: List of tensors to deallocate
-    """
-    for tensor in tensors:
-        if tensor is not None:
-            try:
-                tensor.deallocate(True)
-            except Exception as e:
-                print(f"Warning: Could not deallocate tensor: {e}")
-
-
-def print_tensor_info(tensor, name="Tensor"):
-    """
-    Print information about a TT-Metal tensor.
-
-    Args:
-        tensor: TT-Metal tensor
-        name: Name for identification
-    """
-    if tensor is None:
-        print(f"{name}: None")
-        return
-
-    try:
-        print(f"{name}:")
-        print(f"  - Shape: {tensor.shape}")
-        print(f"  - Dtype: {tensor.dtype}")
-        print(f"  - Layout: {tensor.layout}")
-        print(f"  - Memory config: {tensor.memory_config}")
-    except Exception as e:
-        print(f"{name}: Error getting info - {e}")
-
-
-def benchmark_forward_pass(attention_block, input_tokens, position_indices, num_runs=5):
-    """
-    Benchmark the forward pass of an attention block.
-
-    Args:
-        attention_block: AttentionBlock instance
-        input_tokens: Input token embeddings
-        position_indices: Position indices
-        num_runs: Number of runs for averaging
-
-    Returns:
-        dict: Benchmark results
-    """
-    import time
-
-    print(f"Benchmarking forward pass with {num_runs} runs...")
-
-    # Warmup run
-    _ = attention_block.forward(input_tokens, position_indices)
-
-    # Benchmark runs
-    times = []
-    for i in range(num_runs):
-        start_time = time.time()
-        output = attention_block.forward(input_tokens, position_indices)
-        end_time = time.time()
-
-        run_time = (end_time - start_time) * 1000  # Convert to milliseconds
-        times.append(run_time)
-
-        print(f"  Run {i+1}: {run_time:.2f} ms")
-
-    # Calculate statistics
-    avg_time = sum(times) / len(times)
-    min_time = min(times)
-    max_time = max(times)
-
-    print(f"Benchmark Results:")
-    print(f"  - Average time: {avg_time:.2f} ms")
-    print(f"  - Min time: {min_time:.2f} ms")
-    print(f"  - Max time: {max_time:.2f} ms")
-
-    return {
-        "average_time_ms": avg_time,
-        "min_time_ms": min_time,
-        "max_time_ms": max_time,
-        "num_runs": num_runs,
-        "times_ms": times,
-    }
