@@ -176,25 +176,21 @@ def compute_attention_with_cache_and_current(K_past, V_past, q_rotated, k_curren
     # Get the relevant KV slice, Expand K and V
     K_filled = ttnn.slice(K_past, (0, 0, 0, 0), (1, 8, kv_len, 128))
     V_filled = ttnn.slice(V_past, (0, 0, 0, 0), (1, 8, kv_len, 128))
-    K_filled = ttnn.repeat(K_filled, [1, 4, 1, 1])
-    V_filled = ttnn.repeat(V_filled, [1, 4, 1, 1])
+    K_filled = ttnn.repeat_interleave(K_filled, repeats=4, dim=1)
+    V_filled = ttnn.repeat_interleave(V_filled, repeats=4, dim=1)
     # Get the relevant KV slice, Expand K and V
 
     # Compute attention scores: Q @ K^T
-    qkt_past = ttnn.linear(
-        q_rotated, K_filled, transpose_b=True, compute_kernel_config=compute_kernel_config_hifi4
-    )  # was q_permuted  # [batch, heads, seq_len, total_seq_len]
+    qkt_past = ttnn.linear(q_rotated, K_filled, transpose_b=True, compute_kernel_config=compute_kernel_config_hifi4)
     qkt_past = qkt_past * ATTN_SCALE  # No mask needed
 
     # repeat and permute k
-    k_current = ttnn.repeat(k_current, [1, 4, 1, 1])
+    k_current = ttnn.repeat_interleave(k_current, repeats=4, dim=1)
     qkt_current = ttnn.linear(q_rotated, k_current, transpose_b=True, compute_kernel_config=compute_kernel_config_hifi4)
     print("qkt_past and qkt shapes  : ", qkt_past.shape, qkt_current.shape)
 
     # Apply attention mask if provided
     if attention_mask is not None:
-        # print('TT attention mask : ' , attention_mask)
-
         print("Attn mask shape | dtype      : ", attention_mask.shape, attention_mask.dtype)
         qkt_current = ttnn.typecast(qkt_current, dtype=ttnn.float32)
         qkt_current += attention_mask
