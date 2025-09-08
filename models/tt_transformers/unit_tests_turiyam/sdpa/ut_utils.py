@@ -18,7 +18,7 @@ dtypes_config = {
 }
 
 dtypes_torch_tt = {"torch.bfloat16": ttnn.bfloat16, "torch.float32": ttnn.float32}
-closeness_config = {"ATOL": 1e-03, "RTOL": 5e-02}
+closeness_config = {"ATOL": 1e-03, "RTOL": 1e-02}
 compute_kernel_config_hifi4 = ttnn.WormholeComputeKernelConfig(
     math_fidelity=ttnn.MathFidelity.HiFi4,
     math_approx_mode=False,
@@ -26,6 +26,8 @@ compute_kernel_config_hifi4 = ttnn.WormholeComputeKernelConfig(
     packer_l1_acc=True,
     # False is an order of mangnitude worse. Why?
 )
+
+TILE_SIZE = 32
 
 
 def load_attn_weights_llama_3(layer_idx=0):
@@ -208,6 +210,66 @@ def get_tt_attn_out_llama_3(kv_k, kv_v, q_rotated, k_rotated, v_current, attenti
     return tt_intermediates
 
 
+def tt_rope_llama3(position_ids, q, k, device=None):
+    rot_mat = get_rot_transformation_mat()
+    cos, sin = get_torch_sin_cos_tt(position_ids)
+    cos, sin = cos.unsqueeze(0), sin.unsqueeze(0)
+    cos = ttnn.from_torch(
+        cos,
+        device=device,
+        layout=ttnn.TILE_LAYOUT,
+        dtype=dtypes_config["inputs_tt"],
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+    sin = ttnn.from_torch(
+        sin,
+        device=device,
+        layout=ttnn.TILE_LAYOUT,
+        dtype=dtypes_config["inputs_tt"],
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+    rot_mat = ttnn.from_torch(
+        rot_mat,
+        device=device,
+        layout=ttnn.TILE_LAYOUT,
+        dtype=dtypes_config["inputs_tt"],
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+    q = ttnn.from_torch(
+        q,
+        device=device,
+        layout=ttnn.TILE_LAYOUT,
+        dtype=dtypes_config["inputs_tt"],
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+    k = ttnn.from_torch(
+        k,
+        device=device,
+        layout=ttnn.TILE_LAYOUT,
+        dtype=dtypes_config["inputs_tt"],
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+    print("Shapes in to rope api :: ", q.shape, cos.shape, sin.shape, rot_mat.shape)
+    q_rotated = ttnn.experimental.rotary_embedding_llama(q, cos, sin, rot_mat, is_decode_mode=False)
+    k_rotated = ttnn.experimental.rotary_embedding_llama(k, cos, sin, rot_mat, is_decode_mode=False)
+    q_rotated = tt_to_torch(q_rotated, on_device=True).to(dtypes_config["outputs_torch"])
+    k_rotated = tt_to_torch(k_rotated, on_device=True).to(dtypes_config["outputs_torch"])
+    return q_rotated, k_rotated
+
+
+def get_torch_sin_cos_tt(position_ids):
+    # computation of the basis vectors happen in f32 in Eagle.
+    cos, sin = compute_gather_cos_sin(
+        dhead=128,
+        end=2048,
+        theta=500000.0,
+        scale_factor=8.0,
+        orig_context_len=8192,
+        position_ids=position_ids,  # if dynamic, why pre-compute?
+    )
+    return cos.to(torch.bfloat16), sin.to(torch.bfloat16)
+
+
 def torch_to_tt_default(x, device):
     return ttnn.from_torch(
         x,
@@ -223,8 +285,10 @@ def tt_to_torch(x, on_device=True):
 
 
 def pcc(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    x = x.view(-1).float()
-    y = y.view(-1).float()
+    # x = x.view(-1).float()
+    # y = y.view(-1).float()
+    x = x.flatten()
+    y = y.flatten()
     vx = x - x.mean()
     vy = y - y.mean()
     corr = torch.sum(vx * vy) / torch.sqrt(torch.sum(vx**2) * torch.sum(vy**2))
@@ -234,14 +298,79 @@ def pcc(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 def compare(x: torch.Tensor, y: torch.Tensor, atol=closeness_config["ATOL"], rtol=closeness_config["RTOL"]):
     # pcc , all close, is close ( fail %s )
     # expect x and y to be torch tensors : y is reference, x is input
+    # min/max
     errors = torch.abs((y - x))
     mean_error = torch.mean(errors)
     max_error = torch.max(errors)
-    print("torch allclose           : ", torch.allclose(y, x, atol=atol, rtol=rtol))
+    print(x.dtype, y.dtype)
+    print("torch allclose           : ", torch.allclose(x, y, atol=atol, rtol=rtol))
     print("Mean and Max L1 errors   : ", mean_error, max_error)
     mask = torch.abs(y - x) > (atol + rtol * torch.abs(y))
     fail_fraction = mask.float().mean().item()
     fail_percent = fail_fraction * 100
     print("Fail percent             : ", fail_percent)
-    print("Pcc                      : ", pcc(y, x))
+    print("Pcc                      : ", pcc(x, y))
     return
+
+
+# RoPE utils TT
+def compute_gather_cos_sin(dhead, end, theta, scale_factor, orig_context_len, position_ids):
+    cos, sin = precompute_freqs(dhead, end, theta, scale_factor, orig_context_len)
+    return gather_cos_sin(position_ids, cos, sin)
+
+
+def precompute_freqs(dim: int, end: int, theta, scale_factor, orig_context_len):
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    t = torch.arange(end)
+    if scale_factor is not None:
+        freqs = apply_scaling(freqs, scale_factor, orig_context_len)
+    freqs = torch.outer(t, freqs).float()
+    return torch.cos(freqs), torch.sin(freqs)
+
+
+def apply_scaling(freqs: torch.Tensor, scale_factor: float, orig_context_len: int):
+    # FIXME: Llama-3.x specific scaling - we need to support yarn for Qwen2.5 models
+    # Values obtained from grid search
+    import math
+
+    low_freq_factor = 1.0
+    high_freq_factor = 4.0
+
+    low_freq_wavelen = orig_context_len / low_freq_factor
+    high_freq_wavelen = orig_context_len / high_freq_factor
+    new_freqs = []
+    for freq in freqs:
+        wavelen = 2 * math.pi / freq
+        if wavelen < high_freq_wavelen:
+            new_freqs.append(freq)
+        elif wavelen > low_freq_wavelen:
+            new_freqs.append(freq / scale_factor)
+        else:
+            assert low_freq_wavelen != high_freq_wavelen
+            smooth = (orig_context_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor)
+            new_freqs.append((1 - smooth) * freq / scale_factor + smooth * freq)
+    return torch.tensor(new_freqs, dtype=freqs.dtype, device=freqs.device)
+
+
+# NOTE: modified stack doesn't stack right ? repeat establishes equivalence
+def gather_cos_sin(position_ids, cos, sin):
+    position_id_expanded = position_ids.unsqueeze(1).expand(-1, cos.shape[-1])
+    cos = cos.gather(0, position_id_expanded)
+    sin = sin.gather(0, position_id_expanded)
+    # cos                     = torch.stack([cos, cos], dim=-1).flatten(-2).unsqueeze(0)
+    # sin                     = torch.stack([sin, sin], dim=-1).flatten(-2).unsqueeze(0)
+    cos = cos.repeat(1, 2).unsqueeze(0)
+    sin = sin.repeat(1, 2).unsqueeze(0)
+    return cos, sin
+
+
+def get_rot_transformation_mat():
+    # ROPE op uses a single tile
+    dhead = TILE_SIZE
+    rot_emb_matrix = torch.zeros(1, 1, dhead, dhead)
+    rot_emb_matrix[..., torch.arange(0, dhead, 2), torch.arange(1, dhead, 2)] = 1
+    rot_emb_matrix[..., torch.arange(1, dhead, 2), torch.arange(0, dhead, 2)] = -1
+    return rot_emb_matrix
+
+
+# RoPE utils TT
