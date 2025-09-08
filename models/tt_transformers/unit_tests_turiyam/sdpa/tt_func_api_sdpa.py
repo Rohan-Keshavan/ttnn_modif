@@ -161,7 +161,6 @@ class LlamaRotaryEmbedding_L31(nn.Module):
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
-# CPU Rope
 def compute_attention_with_cache_and_current(K_past, V_past, q_rotated, k_current, v_current, attention_mask=None):
     """Compute attention using KV cache + current tokens."""
 
@@ -811,15 +810,6 @@ class AttentionBlock:
         # V_filled.deallocate(True)
 
     def _compute_attention_with_cache(self, q_rotated, k_current, v_current, attention_mask=None):
-        """
-        Compute attention using KV cache if available, otherwise use current tokens.
-
-        Args:
-            q_rotated: Current Q tokens [seq_len, batch, heads, head_dim]
-            k_current: Current K tokens [seq_len, batch, heads, head_dim]
-            v_current: Current V tokens [seq_len, batch, heads, head_dim]
-            attention_mask: Optional attention mask
-        """
         return self._compute_attention_with_cache_and_current(q_rotated, k_current, v_current, attention_mask)
 
     # Not used anymore
@@ -976,7 +966,7 @@ class AttentionBlock:
         print(f"Final output: {output.shape}")
         return output
 
-    # KV Cache management methods
+    # KV
     def init_kv_cache(self, max_capacity=2048):
         """
         Initialize static KV Cache.
@@ -1053,19 +1043,13 @@ class AttentionBlock:
         print("KV cache reset.")
 
     def resize_kv_cache(self, new_capacity):
-        """
-        Resize KV cache to a specific capacity.
-
-        Args:
-            new_capacity: New cache capacity
-        """
         if new_capacity < self.kv_len:
             raise ValueError(f"New capacity {new_capacity} cannot be less than current length {self.kv_len}")
 
         if new_capacity > self.max_capacity:
             raise ValueError(f"New capacity {new_capacity} cannot exceed max capacity {self.max_capacity}")
 
-        print(f"🔄 Resizing KV cache: {self.cache_capacity} -> {new_capacity}")
+        print(f"Resizing KV cache: {self.cache_capacity} -> {new_capacity}")
 
         # Create new cache with target capacity
         new_k_cache = torch.zeros(new_capacity, self.BATCH_SIZE, self.N_QHEADS, self.HEAD_DIM)
@@ -1103,9 +1087,9 @@ class AttentionBlock:
         self.cache_capacity = new_capacity
         self.kv_len = copy_length
 
-        print(f"✅ Cache resized successfully: {old_capacity} -> {self.cache_capacity}")
-        print(f"   - New cache shapes: {self.K_past.shape}, {self.V_past.shape}")
-        print(f"   - Current length: {self.kv_len}")
+        print(f"Cache resized   : {old_capacity} -> {self.cache_capacity}")
+        print(f"New cache shapes: {self.K_past.shape}, {self.V_past.shape}")
+        print(f"Current length  : {self.kv_len}")
 
     def clear_kv_cache(self):
         """Clear KV cache completely."""
@@ -1133,89 +1117,7 @@ class AttentionBlock:
             "free_space": self.max_capacity - self.kv_len,
         }
 
-    def optimize_cache_size(self, target_utilization=0.8):
-        """
-        Optimize cache size based on target utilization.
-
-        Args:
-            target_utilization: Target utilization ratio (default: 0.8 = 80%)
-        """
-        if self.kv_len == 0:
-            return  # Nothing to optimize
-
-        target_capacity = int(self.kv_len / target_utilization)
-
-        # Ensure we don't go below initial capacity
-        target_capacity = max(target_capacity, 64)
-
-        # Ensure we don't exceed max capacity
-        target_capacity = min(target_capacity, self.max_capacity)
-
-        if target_capacity != self.cache_capacity:
-            print(f"🔄 Optimizing cache size for {target_utilization*100:.0f}% utilization")
-            self.resize_kv_cache(target_capacity)
-        else:
-            print(f"✅ Cache size already optimal for {target_utilization*100:.0f}% utilization")
-
-    def _grow_cache_if_needed(self, required_capacity):
-        """
-        Grow the KV cache if needed to accommodate the required capacity.
-
-        Args:
-            required_capacity: Required cache capacity
-        """
-        if required_capacity <= self.cache_capacity:
-            return  # No growth needed
-
-        # Calculate new capacity
-        new_capacity = max(int(self.cache_capacity * self.growth_factor), required_capacity)
-
-        # Cap at maximum capacity
-        if new_capacity > self.max_capacity:
-            if required_capacity > self.max_capacity:
-                raise ValueError(f"Required capacity {required_capacity} exceeds maximum capacity {self.max_capacity}")
-            new_capacity = self.max_capacity
-
-        print(f"🔄 Growing KV cache: {self.cache_capacity} -> {new_capacity}")
-
-        # Create new larger cache
-        new_k_cache = torch.zeros(new_capacity, self.BATCH_SIZE, self.N_QHEADS, self.HEAD_DIM)
-        new_v_cache = torch.zeros(new_capacity, self.BATCH_SIZE, self.N_QHEADS, self.HEAD_DIM)
-
-        # Copy existing data to new cache
-        if self.kv_len > 0:
-            new_k_cache[: self.kv_len] = self.K_past.to_torch()
-            new_v_cache[: self.kv_len] = self.V_past.to_torch()
-
-        # Deallocate old cache
-        self.K_past.deallocate(True)
-        self.V_past.deallocate(True)
-
-        # Create new TT-Metal tensors
-        self.K_past = ttnn.as_tensor(
-            new_k_cache,
-            device=self.device,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            dtype=ttnn.bfloat16,
-            layout=ttnn.TILE_LAYOUT,
-        )
-
-        self.V_past = ttnn.as_tensor(
-            new_v_cache,
-            device=self.device,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            dtype=ttnn.bfloat16,
-            layout=ttnn.TILE_LAYOUT,
-        )
-
-        # Update capacity
-        old_capacity = self.cache_capacity
-        self.cache_capacity = new_capacity
-
-        print(f"✅ Cache grown successfully: {old_capacity} -> {self.cache_capacity}")
-        print(f"   - New cache shapes: {self.K_past.shape}, {self.V_past.shape}")
-
-    # KV Cache management methods
+    # KV
 
     # cleanup
     def _cleanup_intermediate_tensors(self, tensors):
@@ -1225,9 +1127,8 @@ class AttentionBlock:
                 tensor.deallocate(True)
 
     def cleanup(self):
-        """Clean up all resources."""
         print("")
-        print("Cleaning up AttentionBlock resources...")
+        print("Cleaning up resources...")
 
         # Clean up weights
         for weight_name in ["Q", "K", "V", "O"]:
